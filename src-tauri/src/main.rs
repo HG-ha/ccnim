@@ -5,7 +5,7 @@
 
 mod ide_scan;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -175,7 +175,7 @@ fn user_home() -> Option<PathBuf> {
     }
 }
 
-fn open_terminal_with_claude(cwd: &PathBuf, base_url: &str, token: &str) -> Result<(), String> {
+fn open_terminal_with_claude(cwd: &Path, base_url: &str, token: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
