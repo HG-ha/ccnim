@@ -1,0 +1,110 @@
+name: Release
+
+# ============================================================================
+# CCNim 发布流水线 —— 用法备忘
+# ============================================================================
+# 触发方式：
+#   - 推送 `vX.Y.Z` 形式的 tag（推荐）
+#   - 在 Actions 页手动 dispatch
+#
+# 流水线会做的事：
+#   1. 在 Windows runner 上 build 前端（vite）+ Rust（tauri build）
+#   2. tauri-action 用 secrets 里的私钥给 NSIS 安装包做 minisign 签名
+#   3. 生成 `latest.json`（包含版本号 / 下载链接 / 签名串），客户端的
+#      `tauri-plugin-updater` 就靠这个文件发现新版本
+#   4. 把 `*.exe`、`*.exe.sig`、`latest.json` 一起发到 GitHub Release
+#
+# ----------------------------------------------------------------------------
+# 必需的仓库 Secrets（Settings → Secrets and variables → Actions）
+# ----------------------------------------------------------------------------
+#   TAURI_SIGNING_PRIVATE_KEY            私钥原文，base64 整段。
+#                                        本地用 `npx tauri signer generate
+#                                        --ci -p <密码> -w <文件路径>` 生成。
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   生成私钥时设的密码。
+#
+# ⚠️  私钥一旦丢失，后续就无法签出能被现有客户端接受的更新包；老用户的
+#     自动更新会卡死，只能升级 `src-tauri/tauri.conf.json` 里的 pubkey
+#     重新发布并提示用户手动重装。请把私钥同时备份到密码管理器。
+#
+# ----------------------------------------------------------------------------
+# 发布一个新版本的标准操作（本地执行）
+# ----------------------------------------------------------------------------
+#   1. 同步改三处版本号（必须保持一致，否则 updater 会算错）：
+#        - package.json                "version"
+#        - src-tauri/tauri.conf.json   "version"
+#        - src-tauri/Cargo.toml        [package].version
+#   2. git commit -am "release: vX.Y.Z"
+#      git tag vX.Y.Z
+#      git push origin main --tags
+#   3. 等这个 workflow 跑完（Actions 页能看到进度），Release 页面会自动
+#      出现新版本，里面附带 `*.exe`、`*.exe.sig`、`latest.json`
+#   4. 已经在用旧版本的用户：下次启动应用、或者手动点「检查更新」就会
+#      看到新版本横幅，点「立即安装」即可
+# ============================================================================
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-tauri:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app & publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "CCNim ${{ github.ref_name }}"
+          releaseBody: |
+            从下方 Assets 下载 `CCNim_*_x64-setup.exe` 双击安装即可。
+
+            已安装旧版本的用户：下次启动应用时会自动检测到此版本，或者
+            点仪表盘右上角的「检查更新」按钮立即升级。
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}

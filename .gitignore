@@ -1,0 +1,18 @@
+# Rust
+target/
+
+# Node / Vite
+node_modules/
+dist/
+
+# Tauri
+src-tauri/gen/
+
+# IDE / tooling
+.cursor/
+.serena/
+.claude/
+
+# Local env / runtime
+.env
+*.log

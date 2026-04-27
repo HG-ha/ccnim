@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "crates/app-config",
+    "crates/nim-client",
+    "crates/proxy-core",
+    "crates/proxy-server",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Alishahryar1/free-claude-code"
+
+[workspace.dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.8" }
+directories = "6"
+futures-util = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-updater = { version = "2" }
+tauri-plugin-process = { version = "2" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Size-optimised release profile.
+# Full LTO + single codegen unit + symbol stripping + abort-on-panic
+# typically shaves 30-50% off the final binary compared to Cargo defaults.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false
+debug = false
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = "z"
