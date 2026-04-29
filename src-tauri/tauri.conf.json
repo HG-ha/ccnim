@@ -51,7 +51,7 @@
       "endpoints": [
         "https://github.com/HG-ha/ccnim/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ1NzY0RUM1MDZDRTA3RTQKUldUa0I4NEd4VTUyUmZuNkxxV05LS2dmb2FISG5aNkltN2orb3lHdzBmZTNWT25lbW1aNXBtSkUK\n",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ1NzY0RUM1MDZDRTA3RTQKUldUa0I4NEd4VTUyUmZuNkxxV05LS2dmb2FISG5aNkltN2orb3lHdzBmZTNWT25lbW1aNXBtSkUK",
       "windows": {
         "installMode": "passive"
       }
