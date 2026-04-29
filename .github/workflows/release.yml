@@ -8,14 +8,16 @@ name: Release
 # - 在 Actions 页手动 dispatch
 #
 # 流水线会做的事：
-# 1. 在 Windows runner 上 build 前端（vite）+ Rust（tauri build）
-#    → 生成 NSIS 安装包（.exe）
-# 2. 在 macOS runner 上 build 前端 + Rust
-#    → 生成 DMG 安装包（.dmg）和 .app bundle
-# 3. tauri-action 用 secrets 里的私钥给安装包做 minisign 签名
-# 4. 生成 `latest.json`（包含版本号 / 下载链接 / 签名串），客户端的
+# 1. matrix 三个平台并行 build：
+#    - Windows: NSIS 安装包（.exe）
+#    - macOS:   DMG 安装包（.dmg / aarch64+x64）
+#    - Linux:   AppImage（.AppImage，便携格式，updater 唯一支持的 Linux 格式）
+# 2. tauri-action 用 secrets 里的私钥给安装包做 minisign 签名
+# 3. 生成 `latest.json`（包含版本号 / 下载链接 / 签名串），客户端的
 #    `tauri-plugin-updater` 就靠这个文件发现新版本
-# 5. 把所有平台的安装包和 `latest.json` 一起发到 GitHub Release
+# 4. 三个平台 build 都跑完后，publish-release job 把 draft release 转
+#    为 published，仓库主页右栏 Releases 立刻可见
+# 5. 任何一个平台 build 失败时，release 会留 draft 状态等人工排查
 #
 # ----------------------------------------------------------------------------
 # 必需的仓库 Secrets（Settings → Secrets and variables → Actions）
@@ -47,13 +49,15 @@ name: Release
 #    - package.json "version"
 #    - src-tauri/tauri.conf.json "version"
 #    - src-tauri/Cargo.toml [package].version
+#    然后 `cargo update -p ccnim` 更新 Cargo.lock
 # 2. git commit -am "release: vX.Y.Z"
 #    git tag vX.Y.Z
 #    git push origin main --tags
 # 3. 等这个 workflow 跑完（Actions 页能看到进度），Release 页面会自动
-#    出现新版本，里面附带：
+#    出现新版本（自动从 draft 转为 published），里面附带：
 #    - Windows: `CCNim_*_x64-setup.exe` + `.sig`
-#    - macOS: `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel）
+#    - macOS:   `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel）
+#    - Linux:   `CCNim_*_amd64.AppImage` + `.tar.gz` + `.sig`
 #    - `latest.json`（更新元数据）
 # 4. 已经在用旧版本的用户：下次启动应用时会自动检测到此版本，或者
 #    点仪表盘右上角的「检查更新」按钮立即升级
@@ -166,8 +170,66 @@ jobs:
             
             已安装旧版本的用户：下次启动应用时会自动检测到此版本，或者
             点仪表盘右上角的「检查更新」按钮立即升级。
-          releaseDraft: false
+          # 三个 matrix job 并行跑，最早跑完那个会以 draft 状态创建
+          # release，剩下两个复用同名 draft 上传 asset。等所有 build job
+          # 都跑完，下面的 publish-release job 会一次性把 draft 翻成
+          # published。这样可以避免「第一个 job 跑完时 release 就公开
+          # 了，而其余两个平台 asset 还在上传」的中间状态。
+          releaseDraft: true
           prerelease: false
-          includeUpdaterJson: true
+          uploadUpdaterJson: true
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
+
+  # 所有平台 build 完后，把 draft release 转为 published。
+  # 失败容忍：哪怕某个平台 build 失败，只要至少一个平台成功也能 publish
+  # （手动重跑失败的平台再补 asset 即可）。这里用 if: always() 确保 publish
+  # 始终触发，但最后会校验确实有产物再 publish，否则 release 留 draft 让人工排查。
+  publish-release:
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # GitHub 的 /releases/tags/{tag} 端点对 draft release 会返回 404
+          # （因为 draft 还没正式绑 tag），所以这里通过列表 API + jq 过滤。
+          REL_JSON=$(curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases?per_page=50" \
+            | jq --arg TAG "$TAG" 'map(select(.tag_name == $TAG)) | first // empty')
+
+          if [ -z "$REL_JSON" ] || [ "$REL_JSON" = "null" ]; then
+            echo "::error::找不到 tag=$TAG 对应的 release，可能所有 build job 都失败了"
+            exit 1
+          fi
+
+          REL_ID=$(echo "$REL_JSON" | jq -r '.id')
+          IS_DRAFT=$(echo "$REL_JSON" | jq -r '.draft')
+          ASSET_COUNT=$(echo "$REL_JSON" | jq -r '.assets | length')
+          echo "release id=$REL_ID  draft=$IS_DRAFT  assets=$ASSET_COUNT"
+
+          if [ "$ASSET_COUNT" -lt 1 ]; then
+            echo "::error::release 没有任何 asset，留 draft 让人工排查"
+            exit 1
+          fi
+
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "release 已经 published，跳过"
+            exit 0
+          fi
+
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/$REL_ID" \
+            -d '{"draft": false, "make_latest": "true"}' > /dev/null
+          echo "release $REL_ID 已 publish"
