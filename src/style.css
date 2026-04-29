@@ -2330,3 +2330,110 @@ textarea {
   display: flex;
   gap: 6px;
 }
+
+/* Provider picker — pill row used inside the add/edit key forms.
+   Behaviour: one button per provider type, the active one gets a
+   filled accent style. We use border colour rather than a heavy
+   background change so the row stays calm even on dense forms. */
+.provider-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.provider-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.provider-pill {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 120ms ease-out;
+}
+
+.provider-pill:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.provider-pill.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.provider-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* Per-provider colour-coded badges, used on key cards to show at a
+   glance which upstream a credential is going to talk to. */
+.badge-provider {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.badge-provider.provider-nim {
+  background: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+}
+
+.badge-provider.provider-openai_compat {
+  background: #eef2ff;
+  color: #4338ca;
+  border: 1px solid #c7d2fe;
+}
+
+.badge-provider.provider-anthropic_compat {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+
+/* Endpoint URL row on managed key cards. Sits between the masked
+   credential and the meta dl, kept low-contrast so it doesn't
+   compete visually with the value itself. */
+.key-endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 6px;
+  margin-top: 2px;
+  border-bottom: 1px dashed var(--border);
+  margin-bottom: 8px;
+  min-width: 0;
+}
+
+.key-endpoint-label {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+.key-endpoint {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--surface-3);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}

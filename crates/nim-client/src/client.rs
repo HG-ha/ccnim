@@ -4,25 +4,30 @@ use std::time::Duration;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use proxy_core::{ChatCompletionChunk, ChatCompletionRequest, NimModelList};
+use proxy_core::{ChatCompletionChunk, ChatCompletionRequest, NimModelList, ProviderKind};
 use reqwest::{header, Client, StatusCode};
 use thiserror::Error;
 
 use crate::{KeyLease, KeyPool};
 
+/// Canonical NVIDIA NIM endpoint. Kept as an exported constant for
+/// callers (the Tauri layer, smoke tests) that still want to reference
+/// the default explicitly. Per-key base URLs are stored in
+/// [`crate::KeyPoolEntry::base_url`] and propagate through the
+/// [`KeyLease`] returned by `acquire`.
 pub const NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 
 #[derive(Debug, Error)]
 pub enum NimClientError {
-    #[error("no healthy NVIDIA NIM API key is available")]
+    #[error("no healthy upstream API key is available")]
     NoHealthyKey,
-    #[error("NVIDIA NIM authentication failed")]
+    #[error("upstream authentication failed")]
     Authentication,
-    #[error("NVIDIA NIM rate limited all available keys")]
+    #[error("upstream rate limited all available keys")]
     RateLimited,
-    #[error("NVIDIA NIM request failed: {0}")]
+    #[error("upstream request failed: {0}")]
     Request(String),
-    #[error("NVIDIA NIM stream parse failed: {0}")]
+    #[error("upstream stream parse failed: {0}")]
     Stream(String),
 }
 
@@ -30,10 +35,18 @@ pub type NimResult<T> = Result<T, NimClientError>;
 pub type NimChunkStream =
     Pin<Box<dyn Stream<Item = NimResult<ChatCompletionChunk>> + Send + 'static>>;
 
+/// HTTP client that talks to OpenAI-compatible upstreams (NIM and any
+/// "OpenAI-compat" provider — DeepSeek, Moonshot, Groq, OpenRouter, …).
+/// The base URL is resolved per request from the key lease, not stored
+/// on the client itself, so a single instance can multiplex over keys
+/// pointing at completely different hosts.
+///
+/// The client deliberately does *not* own a [`KeyPool`]: callers
+/// acquire a lease themselves so that the choice of provider /
+/// fallback is driven by request context, not by the HTTP layer.
 #[derive(Clone)]
 pub struct NimClient {
     http: Client,
-    base_url: String,
     key_pool: KeyPool,
 }
 
@@ -44,21 +57,24 @@ impl NimClient {
             .timeout(Duration::from_secs(180))
             .build()
             .map_err(|e| NimClientError::Request(e.to_string()))?;
-        Ok(Self {
-            http,
-            base_url: NIM_BASE_URL.to_string(),
-            key_pool,
-        })
+        Ok(Self { http, key_pool })
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into().trim_end_matches('/').to_string();
-        self
-    }
-
-    pub async fn list_models(&self) -> NimResult<NimModelList> {
-        let lease = self.key_pool.acquire();
-        let mut request = self.http.get(format!("{}/models", self.base_url));
+    /// List the model catalog of the upstream addressed by some
+    /// healthy key with provider `provider`. Used by the Tauri layer
+    /// to populate the model dropdown — only meaningful for OpenAI-
+    /// compatible providers (NIM and OpenaiCompat). For Anthropic the
+    /// proxy doesn't expose a `/v1/models` of its own; callers should
+    /// avoid calling this with `AnthropicCompat`.
+    pub async fn list_models(&self, provider: ProviderKind) -> NimResult<NimModelList> {
+        let lease = self.key_pool.acquire_for(provider);
+        let base = match &lease {
+            Some(l) => l.base_url().to_string(),
+            None => provider.default_base_url().to_string(),
+        };
+        let mut request = self
+            .http
+            .get(format!("{}/models", base.trim_end_matches('/')));
         if let Some(lease) = lease.as_ref() {
             request = request.bearer_auth(lease.key());
         }
@@ -86,14 +102,36 @@ impl NimClient {
         Ok(models)
     }
 
-    pub async fn stream_chat(&self, body: ChatCompletionRequest) -> NimResult<NimChunkStream> {
-        let lease = self
-            .key_pool
-            .acquire()
-            .ok_or(NimClientError::NoHealthyKey)?;
+    /// Borrow access to the underlying key pool. The proxy server uses
+    /// this to acquire leases of its choosing before calling
+    /// [`Self::stream_chat_with_lease`].
+    pub fn key_pool(&self) -> &KeyPool {
+        &self.key_pool
+    }
+
+    /// Stream a chat completion via an OpenAI-compatible upstream using
+    /// an already-acquired key lease. The caller (typically the proxy
+    /// server) is in charge of picking the lease — that lets the server
+    /// choose a provider based on the request and avoids re-acquiring
+    /// the same key twice.
+    ///
+    /// The lease's provider must be NIM or OpenaiCompat; passing an
+    /// Anthropic-compat lease here is a programming error caught by a
+    /// debug assertion (and, in release builds, a generic `Request`
+    /// error from the wrong endpoint shape).
+    pub async fn stream_chat_with_lease(
+        &self,
+        lease: KeyLease,
+        body: ChatCompletionRequest,
+    ) -> NimResult<NimChunkStream> {
+        debug_assert!(
+            !matches!(lease.provider(), ProviderKind::AnthropicCompat),
+            "Anthropic-compat upstream must use AnthropicPassthroughClient"
+        );
+        let base = lease.base_url().trim_end_matches('/').to_string();
         let response = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(format!("{base}/chat/completions"))
             .bearer_auth(lease.key())
             .json(&body)
             .send()
@@ -132,6 +170,84 @@ impl NimClient {
         Ok(Box::pin(stream))
     }
 }
+
+/// HTTP client that forwards Anthropic-shaped requests verbatim to an
+/// Anthropic-compatible upstream. Skips the entire anthropic→openai→
+/// anthropic conversion that [`NimClient`] performs, so native features
+/// (`thinking` blocks, `tool_use` schema, custom `metadata`) survive the
+/// round trip.
+///
+/// Like [`NimClient`], it does not own the [`KeyPool`] — leases are
+/// acquired by the caller and passed in.
+#[derive(Clone)]
+pub struct AnthropicPassthroughClient {
+    http: Client,
+}
+
+impl AnthropicPassthroughClient {
+    pub fn new() -> NimResult<Self> {
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| NimClientError::Request(e.to_string()))?;
+        Ok(Self { http })
+    }
+
+    /// Forward an Anthropic Messages request to the upstream and return
+    /// the raw byte stream of its SSE response. The proxy server splices
+    /// these bytes straight into the client connection — we do not
+    /// attempt to parse, validate, or rewrite events along the way,
+    /// which is the whole point of "pass-through".
+    ///
+    /// `body_json` is the JSON-serialized [`proxy_core::MessagesRequest`]
+    /// (with `model` already rewritten by the caller to whatever the
+    /// upstream expects).
+    pub async fn stream_messages_with_lease(
+        &self,
+        lease: KeyLease,
+        body_json: serde_json::Value,
+    ) -> NimResult<AnthropicByteStream> {
+        debug_assert!(
+            matches!(lease.provider(), ProviderKind::AnthropicCompat),
+            "AnthropicPassthroughClient requires an AnthropicCompat lease"
+        );
+        let base = lease.base_url().trim_end_matches('/').to_string();
+
+        let response = self
+            .http
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", lease.key())
+            .header("anthropic-version", "2023-06-01")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/event-stream")
+            .json(&body_json)
+            .send()
+            .await
+            .map_err(|e| {
+                lease.pool().mark_network_error(lease.key_id());
+                NimClientError::Request(e.to_string())
+            })?;
+
+        let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
+        handle_status_with_retry(&lease, response.status(), retry_after)?;
+        lease.pool().mark_success(lease.key_id());
+
+        let upstream = response.bytes_stream();
+        let stream = try_stream! {
+            let _lease = lease;
+            futures_util::pin_mut!(upstream);
+            while let Some(item) = upstream.next().await {
+                let bytes: Bytes = item.map_err(|e| NimClientError::Stream(e.to_string()))?;
+                yield bytes;
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Raw SSE byte stream returned by [`AnthropicPassthroughClient`].
+pub type AnthropicByteStream = Pin<Box<dyn Stream<Item = NimResult<Bytes>> + Send + 'static>>;
 
 fn handle_status_with_retry(
     lease: &KeyLease,

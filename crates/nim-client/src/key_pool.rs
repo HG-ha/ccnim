@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use proxy_core::ProviderKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -17,22 +18,30 @@ pub enum KeyState {
 }
 
 /// Configuration knobs for a single key as seen by the pool. Carries enough
-/// metadata to surface label/expiry on the dashboard without re-reading the
-/// secrets file on every snapshot.
+/// metadata to surface label/expiry/provider on the dashboard without
+/// re-reading the secrets file on every snapshot, and enough information
+/// for [`KeyLease`] consumers to know which upstream protocol/URL to talk
+/// to.
 #[derive(Debug, Clone, Default)]
 pub struct KeyPoolEntry {
     pub value: String,
     pub label: Option<String>,
     /// Unix epoch seconds. `None` means "never expires".
     pub expires_at: Option<i64>,
+    /// Upstream protocol family (selects request/response handling).
+    pub provider: ProviderKind,
+    /// Already-resolved base URL. Callers should pass the result of
+    /// [`crate::app_config::NimApiKey::effective_base_url`] (or any
+    /// equivalent) so the pool never needs to reach back into config
+    /// to resolve defaults.
+    pub base_url: String,
 }
 
 impl KeyPoolEntry {
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            label: None,
-            expires_at: None,
+            ..Default::default()
         }
     }
 }
@@ -43,6 +52,14 @@ pub struct KeySnapshot {
     pub masked: String,
     pub label: Option<String>,
     pub expires_at: Option<i64>,
+    /// Provider family for this key. The dashboard renders a small badge
+    /// (`NIM` / `OpenAI 兼容` / `Anthropic 兼容`) so users can tell at a
+    /// glance which upstream is going to be hit.
+    pub provider: ProviderKind,
+    /// The base URL the proxy will actually send requests to for this
+    /// key. Echoed back so the GUI can show "via …" alongside the
+    /// masked credential.
+    pub base_url: String,
     pub state: KeyState,
     pub inflight: usize,
     pub recent_requests: usize,
@@ -55,6 +72,8 @@ struct KeyEntry {
     value: String,
     label: Option<String>,
     expires_at: Option<i64>,
+    provider: ProviderKind,
+    base_url: String,
     state: KeyState,
     inflight: usize,
     recent_requests: VecDeque<Instant>,
@@ -69,6 +88,8 @@ impl KeyEntry {
             value: entry.value,
             label: entry.label,
             expires_at: entry.expires_at,
+            provider: entry.provider,
+            base_url: entry.base_url,
             state: KeyState::Healthy,
             inflight: 0,
             recent_requests: VecDeque::new(),
@@ -78,14 +99,17 @@ impl KeyEntry {
     }
 
     /// Build a new entry that inherits live counters from `prev`. Used by
-    /// [`KeyPool::update_keys`] so editing a label or expiry does not reset
-    /// inflight / recent / failure stats for an unchanged key.
+    /// [`KeyPool::update_keys`] so editing a label / expiry / base URL
+    /// does not reset inflight / recent / failure stats for an unchanged
+    /// key.
     fn merged(id: usize, entry: KeyPoolEntry, prev: &KeyEntry) -> Self {
         Self {
             id,
             value: entry.value,
             label: entry.label,
             expires_at: entry.expires_at,
+            provider: entry.provider,
+            base_url: entry.base_url,
             state: prev.state,
             inflight: prev.inflight,
             recent_requests: prev.recent_requests.clone(),
@@ -107,6 +131,8 @@ pub struct KeyLease {
     pool: KeyPool,
     key_id: usize,
     key: String,
+    provider: ProviderKind,
+    base_url: String,
 }
 
 impl KeyPool {
@@ -129,6 +155,22 @@ impl KeyPool {
     }
 
     pub fn acquire(&self) -> Option<KeyLease> {
+        self.acquire_filtered(|_| true)
+    }
+
+    /// Acquire a healthy lease, restricted to keys whose provider matches
+    /// `provider`. Returns `None` if no key for that provider is healthy
+    /// (regardless of whether other providers have capacity), so the
+    /// caller can surface a precise error like "no healthy Anthropic-
+    /// compatible key" instead of falsely picking a NIM key.
+    pub fn acquire_for(&self, provider: ProviderKind) -> Option<KeyLease> {
+        self.acquire_filtered(|entry| entry.provider == provider)
+    }
+
+    fn acquire_filtered<F>(&self, predicate: F) -> Option<KeyLease>
+    where
+        F: Fn(&KeyEntry) -> bool,
+    {
         let now = Instant::now();
         let now_unix = current_unix_secs();
         let mut entries = self.inner.lock();
@@ -141,7 +183,9 @@ impl KeyPool {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                entry.state == KeyState::Healthy && entry.recent_requests.len() < self.rate_limit
+                predicate(entry)
+                    && entry.state == KeyState::Healthy
+                    && entry.recent_requests.len() < self.rate_limit
             })
             .min_by_key(|(_, entry)| (entry.inflight, entry.recent_requests.len()))
             .map(|(idx, _)| idx)?;
@@ -153,6 +197,8 @@ impl KeyPool {
             pool: self.clone(),
             key_id: entry.id,
             key: entry.value.clone(),
+            provider: entry.provider,
+            base_url: entry.base_url.clone(),
         })
     }
 
@@ -220,6 +266,8 @@ impl KeyPool {
                     masked: mask_key(&entry.value),
                     label: entry.label.clone(),
                     expires_at: entry.expires_at,
+                    provider: entry.provider,
+                    base_url: entry.base_url.clone(),
                     state: entry.state,
                     inflight: entry.inflight,
                     recent_requests: entry.recent_requests.len(),
@@ -241,6 +289,17 @@ impl KeyLease {
 
     pub fn pool(&self) -> &KeyPool {
         &self.pool
+    }
+
+    /// Provider associated with the leased key. Lets the upstream client
+    /// decide which protocol/path to use without re-querying the pool.
+    pub fn provider(&self) -> ProviderKind {
+        self.provider
+    }
+
+    /// Already-resolved base URL for this key (no trailing slash).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 }
 
@@ -387,11 +446,13 @@ mod tests {
                     value: "nvapi-old".to_string(),
                     label: Some("expired".into()),
                     expires_at: Some(past),
+                    ..Default::default()
                 },
                 KeyPoolEntry {
                     value: "nvapi-new".to_string(),
                     label: None,
                     expires_at: Some(future),
+                    ..Default::default()
                 },
             ],
             40,
@@ -424,11 +485,13 @@ mod tests {
                 value: "nvapi-first".to_string(),
                 label: Some("primary".into()),
                 expires_at: None,
+                ..Default::default()
             },
             KeyPoolEntry {
                 value: "nvapi-second".to_string(),
                 label: None,
                 expires_at: None,
+                ..Default::default()
             },
         ]);
         let snaps = pool.snapshots();
@@ -436,5 +499,67 @@ mod tests {
         assert_eq!(first.label.as_deref(), Some("primary"));
         assert_eq!(first.recent_requests, 1, "should retain recent_requests");
         let _ = id_before;
+    }
+
+    /// `acquire_for(provider)` returns only keys with the matching protocol
+    /// family, even if other providers also have healthy capacity.
+    #[test]
+    fn acquire_for_filters_by_provider() {
+        let pool = KeyPool::new(
+            vec![
+                KeyPoolEntry {
+                    value: "nvapi-x".into(),
+                    provider: ProviderKind::Nim,
+                    base_url: "https://integrate.api.nvidia.com/v1".into(),
+                    ..Default::default()
+                },
+                KeyPoolEntry {
+                    value: "sk-deepseek".into(),
+                    provider: ProviderKind::OpenaiCompat,
+                    base_url: "https://api.deepseek.com".into(),
+                    ..Default::default()
+                },
+                KeyPoolEntry {
+                    value: "sk-ant-x".into(),
+                    provider: ProviderKind::AnthropicCompat,
+                    base_url: "https://api.anthropic.com".into(),
+                    ..Default::default()
+                },
+            ],
+            40,
+            Duration::from_secs(60),
+        );
+
+        let nim = pool.acquire_for(ProviderKind::Nim).unwrap();
+        assert_eq!(nim.key(), "nvapi-x");
+        assert_eq!(nim.provider(), ProviderKind::Nim);
+        assert_eq!(nim.base_url(), "https://integrate.api.nvidia.com/v1");
+        drop(nim);
+
+        let oai = pool.acquire_for(ProviderKind::OpenaiCompat).unwrap();
+        assert_eq!(oai.key(), "sk-deepseek");
+        drop(oai);
+
+        let anth = pool.acquire_for(ProviderKind::AnthropicCompat).unwrap();
+        assert_eq!(anth.base_url(), "https://api.anthropic.com");
+    }
+
+    /// When no key exists for a given provider, acquire_for returns None
+    /// instead of falling back to a different provider.
+    #[test]
+    fn acquire_for_returns_none_when_no_provider_match() {
+        let pool = KeyPool::new(
+            vec![KeyPoolEntry {
+                value: "nvapi-x".into(),
+                provider: ProviderKind::Nim,
+                base_url: "https://integrate.api.nvidia.com/v1".into(),
+                ..Default::default()
+            }],
+            40,
+            Duration::from_secs(60),
+        );
+        assert!(pool.acquire_for(ProviderKind::AnthropicCompat).is_none());
+        assert!(pool.acquire_for(ProviderKind::OpenaiCompat).is_none());
+        assert!(pool.acquire_for(ProviderKind::Nim).is_some());
     }
 }

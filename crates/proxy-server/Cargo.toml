@@ -9,6 +9,7 @@ app-config = { path = "../app-config" }
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
+bytes = "1"
 futures-util.workspace = true
 nim-client = { path = "../nim-client" }
 proxy-core = { path = "../proxy-core" }

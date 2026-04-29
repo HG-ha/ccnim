@@ -4,11 +4,19 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./style.css";
 
+/// Wire-level discriminator for upstream protocol families. Must stay in
+/// lockstep with the Rust `ProviderKind` enum (snake_case, `serde(rename_all)`).
+type ProviderKind = "nim" | "openai_compat" | "anthropic_compat";
+
 type NimApiKey = {
   id: string;
   value: string;
   label?: string | null;
   expires_at?: number | null;
+  /// Optional in legacy configs; backend defaults missing values to "nim".
+  provider?: ProviderKind;
+  /// Empty / undefined means "use provider's default base URL".
+  base_url?: string;
 };
 
 type AppConfig = {
@@ -32,11 +40,65 @@ type KeySnapshot = {
   masked: string;
   label?: string | null;
   expires_at?: number | null;
+  provider: ProviderKind;
+  base_url: string;
   state: string;
   inflight: number;
   recent_requests: number;
   failure_count: number;
 };
+
+/// Provider metadata for UI rendering and validation. The defaults come
+/// from `ProviderKind::default_base_url` on the Rust side; the labels
+/// here are user-facing only and do not need to match anything.
+const PROVIDERS: Record<
+  ProviderKind,
+  {
+    /// Long form shown in dropdown rows.
+    label: string;
+    /// Short badge text for cards.
+    short: string;
+    /// Pre-fill for the base URL input. Empty string means "user must
+    /// type one explicitly" (true for `openai_compat`).
+    defaultBaseUrl: string;
+    /// Placeholder shown when the base URL is empty.
+    placeholder: string;
+    /// Free-form description shown beneath the dropdown.
+    description: string;
+    /// Sample key value used as placeholder text.
+    keyPlaceholder: string;
+  }
+> = {
+  nim: {
+    label: "NVIDIA NIM",
+    short: "NIM",
+    defaultBaseUrl: "https://integrate.api.nvidia.com/v1",
+    placeholder: "https://integrate.api.nvidia.com/v1",
+    description:
+      "NVIDIA NIM 官方端点。Key 必须以 nvapi- 开头。多 Key 自动轮询、限速。",
+    keyPlaceholder: "nvapi-xxxxxxxxxxxxxxxx",
+  },
+  openai_compat: {
+    label: "OpenAI 兼容",
+    short: "OpenAI",
+    defaultBaseUrl: "",
+    placeholder: "https://api.deepseek.com 或 https://your-host/v1",
+    description:
+      "任何 OpenAI 兼容的 /chat/completions 端点。常见：DeepSeek、Moonshot、Groq、OpenRouter、自建 vLLM。",
+    keyPlaceholder: "sk-xxxxxxxxxxxxxxxx",
+  },
+  anthropic_compat: {
+    label: "Anthropic 兼容",
+    short: "Anthropic",
+    defaultBaseUrl: "https://api.anthropic.com",
+    placeholder: "https://api.anthropic.com",
+    description:
+      "原生 Anthropic Messages API。请求/响应直接透传，保留 thinking、tool_use 等原生能力。",
+    keyPlaceholder: "sk-ant-xxxxxxxxxxxxxxxx",
+  },
+};
+
+const PROVIDER_KINDS: ProviderKind[] = ["nim", "openai_compat", "anthropic_compat"];
 
 type ProxyStatus = {
   running: boolean;
@@ -99,9 +161,33 @@ const MODELS_REFRESH_MS = 30 * 60 * 1000;
 type AddPanelMode = "single" | "batch" | null;
 let addPanel: AddPanelMode = null;
 let editingKeyId: string | null = null;
-const singleAdd = { value: "", label: "", expiresAt: "" };
-const batchAdd = { values: "", labelPrefix: "", expiresAt: "" };
-const editForm = { value: "", label: "", expiresAt: "" };
+
+/// Per-form scratch state. `baseUrl` is what the user typed (empty
+/// string means "fall back to provider default" — the backend honours
+/// the same convention). The `provider` field is always set to a
+/// concrete value; we never let it be undefined to keep the rendering
+/// code branchless.
+const singleAdd = {
+  value: "",
+  label: "",
+  expiresAt: "",
+  provider: "nim" as ProviderKind,
+  baseUrl: "",
+};
+const batchAdd = {
+  values: "",
+  labelPrefix: "",
+  expiresAt: "",
+  provider: "nim" as ProviderKind,
+  baseUrl: "",
+};
+const editForm = {
+  value: "",
+  label: "",
+  expiresAt: "",
+  provider: "nim" as ProviderKind,
+  baseUrl: "",
+};
 
 const appWindow = getCurrentWindow();
 
@@ -383,14 +469,29 @@ async function stopProxy() {
   render();
 }
 
-/// Silent background refresh of the upstream model list. Skips the call if no
-/// API key is configured (the proxy would just bounce it). Only re-renders
-/// when the list actually changed AND the user is currently looking at the
-/// models page, so periodic ticks don't disturb other workflows.
-async function fetchModelsAuto() {
+/// Silent background refresh of the upstream model list. Skips the call
+/// if no API key is configured (the proxy would just bounce it). Only
+/// re-renders when the list actually changed AND the user is currently
+/// looking at the models page, so periodic ticks don't disturb other
+/// workflows.
+///
+/// `provider` selects which upstream catalog to fetch. We default to
+/// the first OpenAI-compatible provider the user has a key for so the
+/// dropdown is populated regardless of whether NIM is in use; if the
+/// only configured keys are Anthropic-compat we skip the fetch
+/// (Anthropic upstreams don't expose a /v1/models endpoint).
+async function fetchModelsAuto(provider?: ProviderKind) {
   if (!config || config.nim_api_keys.length === 0) return;
+  const target =
+    provider ??
+    config.nim_api_keys
+      .map((k) => (k.provider ?? "nim") as ProviderKind)
+      .find((p) => p !== "anthropic_compat");
+  if (!target || target === "anthropic_compat") return;
   try {
-    const response = await invoke<{ data: Array<{ id: string }> }>("fetch_nim_models");
+    const response = await invoke<{ data: Array<{ id: string }> }>("fetch_nim_models", {
+      provider: target,
+    });
     const next = response.data.map((m) => m.id).sort();
     const changed =
       next.length !== models.length || next.some((m, i) => m !== models[i]);
@@ -486,10 +587,14 @@ function openAddPanel(mode: AddPanelMode) {
     singleAdd.value = "";
     singleAdd.label = "";
     singleAdd.expiresAt = "";
+    singleAdd.provider = "nim";
+    singleAdd.baseUrl = "";
   } else if (mode === "batch") {
     batchAdd.values = "";
     batchAdd.labelPrefix = "";
     batchAdd.expiresAt = "";
+    batchAdd.provider = "nim";
+    batchAdd.baseUrl = "";
   }
   editingKeyId = null;
   render();
@@ -503,8 +608,13 @@ function closeAddPanel() {
 async function submitSingleAdd() {
   if (!config) return;
   const value = singleAdd.value.trim();
-  if (!isValidNvapi(value)) {
-    toast("Key 必须以 nvapi- 开头并且是合法的 NVIDIA NIM API Key", "error");
+  const valueError = validateKeyValue(value, singleAdd.provider);
+  if (valueError) {
+    toast(valueError, "error");
+    return;
+  }
+  if (!hasUsableBaseUrl(singleAdd.provider, singleAdd.baseUrl)) {
+    toast("请填写端点 URL（OpenAI 兼容供应商没有默认地址）", "error");
     return;
   }
   if (config.nim_api_keys.some((k) => k.value === value)) {
@@ -516,6 +626,8 @@ async function submitSingleAdd() {
     value,
     label: singleAdd.label.trim() || null,
     expires_at: datetimeLocalToUnix(singleAdd.expiresAt),
+    provider: singleAdd.provider,
+    base_url: singleAdd.baseUrl.trim().replace(/\/$/, ""),
   };
   config.nim_api_keys.push(newKey);
   if (!(await save(true))) {
@@ -529,7 +641,12 @@ async function submitSingleAdd() {
   render();
   // Newly available key: kick off an immediate model-list pull so the
   // models page populates without waiting for the next 30-min tick.
-  void fetchModelsAuto();
+  // Only meaningful for OpenAI-compatible providers — Anthropic-compat
+  // hosts have no /v1/models so we skip the request rather than
+  // surface an error.
+  if (newKey.provider !== "anthropic_compat") {
+    void fetchModelsAuto(newKey.provider);
+  }
 }
 
 async function submitBatchImport() {
@@ -539,17 +656,24 @@ async function submitBatchImport() {
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
   if (candidates.length === 0) {
-    toast("请粘贴至少一行 nvapi- 开头的 Key", "error");
+    toast("请粘贴至少一行 Key", "error");
     return;
   }
-  const invalid = candidates.filter((c) => !isValidNvapi(c));
+  if (!hasUsableBaseUrl(batchAdd.provider, batchAdd.baseUrl)) {
+    toast("请填写端点 URL（OpenAI 兼容供应商没有默认地址）", "error");
+    return;
+  }
+  const invalid = candidates
+    .map((c) => ({ raw: c, err: validateKeyValue(c, batchAdd.provider) }))
+    .filter((x) => x.err !== null);
   if (invalid.length > 0) {
-    toast(`有 ${invalid.length} 行不是合法的 nvapi- Key，已中止导入`, "error");
+    toast(`有 ${invalid.length} 行 Key 校验失败：${invalid[0].err}，已中止导入`, "error");
     return;
   }
   const existing = new Set(config.nim_api_keys.map((k) => k.value));
   const sharedExpiry = datetimeLocalToUnix(batchAdd.expiresAt);
   const sharedLabel = batchAdd.labelPrefix.trim() || null;
+  const sharedBaseUrl = batchAdd.baseUrl.trim().replace(/\/$/, "");
   const newKeys: NimApiKey[] = [];
   let skipped = 0;
   for (const raw of candidates) {
@@ -563,6 +687,8 @@ async function submitBatchImport() {
       value: raw,
       label: sharedLabel,
       expires_at: sharedExpiry,
+      provider: batchAdd.provider,
+      base_url: sharedBaseUrl,
     };
     config.nim_api_keys.push(k);
     newKeys.push(k);
@@ -582,7 +708,9 @@ async function submitBatchImport() {
   );
   addPanel = null;
   render();
-  void fetchModelsAuto();
+  if (batchAdd.provider !== "anthropic_compat") {
+    void fetchModelsAuto(batchAdd.provider);
+  }
 }
 
 function beginEditKey(id: string) {
@@ -592,6 +720,8 @@ function beginEditKey(id: string) {
   editForm.value = key.value;
   editForm.label = key.label ?? "";
   editForm.expiresAt = unixToDatetimeLocal(key.expires_at);
+  editForm.provider = key.provider ?? "nim";
+  editForm.baseUrl = key.base_url ?? "";
   editingKeyId = id;
   addPanel = null;
   render();
@@ -607,8 +737,13 @@ async function submitEditKey(id: string) {
   const idx = config.nim_api_keys.findIndex((k) => k.id === id);
   if (idx < 0) return;
   const value = editForm.value.trim();
-  if (!isValidNvapi(value)) {
-    toast("Key 必须以 nvapi- 开头并且是合法的 NVIDIA NIM API Key", "error");
+  const valueError = validateKeyValue(value, editForm.provider);
+  if (valueError) {
+    toast(valueError, "error");
+    return;
+  }
+  if (!hasUsableBaseUrl(editForm.provider, editForm.baseUrl)) {
+    toast("请填写端点 URL（OpenAI 兼容供应商没有默认地址）", "error");
     return;
   }
   if (config.nim_api_keys.some((k, i) => i !== idx && k.value === value)) {
@@ -621,6 +756,8 @@ async function submitEditKey(id: string) {
     value,
     label: editForm.label.trim() || null,
     expires_at: datetimeLocalToUnix(editForm.expiresAt),
+    provider: editForm.provider,
+    base_url: editForm.baseUrl.trim().replace(/\/$/, ""),
   };
   if (!(await save(true))) {
     config.nim_api_keys[idx] = before;
@@ -784,8 +921,40 @@ function formatExpiry(unix: number | null | undefined): { text: string; tone: Ex
   return { text: `${dateText}（剩 ${days}d）`, tone: "ok" };
 }
 
+/// True for syntactically plausible NIM API keys (`nvapi-` + ≥10 chars
+/// of `[A-Za-z0-9_-]`). We deliberately keep this regex strict for the
+/// NIM provider — pasting an OpenAI-shaped key into a NIM slot is a
+/// configuration mistake that's worth catching at submit time.
 function isValidNvapi(raw: string): boolean {
   return /^nvapi-[A-Za-z0-9_\-]{10,}$/.test(raw.trim());
+}
+
+/// Provider-aware key value validation. NIM keeps the strict
+/// `nvapi-` regex; OpenAI and Anthropic compatible providers only
+/// require a non-empty value (they accept too many bearer formats to
+/// pin down a useful regex).
+function validateKeyValue(raw: string, provider: ProviderKind): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return "Key 不能为空";
+  if (provider === "nim" && !isValidNvapi(trimmed)) {
+    return "NIM Key 必须以 nvapi- 开头";
+  }
+  return null;
+}
+
+/// Returns the base URL the proxy will actually use for a key — user
+/// input if non-empty, otherwise the provider's canonical default.
+function effectiveBaseUrl(provider: ProviderKind, baseUrl: string | undefined | null): string {
+  const trimmed = (baseUrl ?? "").trim();
+  if (trimmed) return trimmed.replace(/\/$/, "");
+  return PROVIDERS[provider].defaultBaseUrl;
+}
+
+/// True if the form fields supply enough information for the backend
+/// to actually talk to the upstream. `openai_compat` requires the
+/// user to type a base URL because there is no canonical default.
+function hasUsableBaseUrl(provider: ProviderKind, baseUrl: string | undefined | null): boolean {
+  return effectiveBaseUrl(provider, baseUrl).length > 0;
 }
 
 function copyButton(value: string, attrName = "copy"): string {
@@ -1129,11 +1298,14 @@ function renderKeyCard(k: KeySnapshot): string {
   const widthPct = (ratio * 100).toFixed(1);
   const stateNorm = normalizeState(k.state);
   const expiry = formatExpiry(k.expires_at);
+  const providerMeta = PROVIDERS[k.provider];
+  const providerBadge = `<span class="badge badge-provider provider-${k.provider}" title="${escapeHtml(k.base_url)}">${escapeHtml(providerMeta.short)}</span>`;
   return `
     <div class="key-card state-${stateNorm} expiry-${expiry.tone}">
       <div class="key-card-head">
         <div class="key-id-row">
           <span class="key-num">#${k.id + 1}</span>
+          ${providerBadge}
           <span class="key-id selectable">${escapeHtml(k.masked)}</span>
         </div>
         ${keyStateBadge(k.state)}
@@ -1228,11 +1400,24 @@ function renderKeys(): string {
   const { limit, window: rateWindow } = rateLimitOf();
   const snapshots = proxyStatus?.keys ?? [];
   const totalQuota = config.nim_api_keys.length * limit;
+  // Per-provider count — gives the user a quick sanity check that
+  // keys actually got tagged with the protocol they intended.
+  const providerCounts = config.nim_api_keys.reduce<Record<ProviderKind, number>>(
+    (acc, k) => {
+      const p = (k.provider ?? "nim") as ProviderKind;
+      acc[p] = (acc[p] ?? 0) + 1;
+      return acc;
+    },
+    { nim: 0, openai_compat: 0, anthropic_compat: 0 },
+  );
+  const providerSummary = PROVIDER_KINDS.filter((k) => providerCounts[k] > 0)
+    .map((k) => `${PROVIDERS[k].short} × ${providerCounts[k]}`)
+    .join(" · ");
   return `
     <header class="page-header">
       <div>
         <h1>API Keys</h1>
-        <p>逐个添加或批量导入 nvapi- Key，可附加备注与到期时间。运行时按健康度、并发与最近请求自动切换。</p>
+        <p>逐个添加或批量导入上游 API Key，每个 Key 可独立选择端点类型（NIM / OpenAI 兼容 / Anthropic 兼容）和上游 URL。运行时按健康度、并发与最近请求自动切换，跨端点统一调度。</p>
       </div>
       <div class="header-actions">
         ${proxyStatus?.running ? `<span class="hint-inline">编辑后立即生效，无需重启代理</span>` : ""}
@@ -1242,8 +1427,8 @@ function renderKeys(): string {
     <div class="banner">
       <div class="banner-icon">${ICONS.bolt}</div>
       <div class="banner-text">
-        <strong>每个 NVIDIA NIM 账号限速 <span class="mono">${limit}</span> 次 / <span class="mono">${rateWindow}</span> 秒</strong>
-        <p>当前共配置 <strong>${config.nim_api_keys.length}</strong> 个 Key，理论合并配额约 <strong>${totalQuota}</strong> 次/分钟。已过期、被上游禁用或冷却中的 Key 不参与轮询。</p>
+        <strong>每个 Key 独立限速 <span class="mono">${limit}</span> 次 / <span class="mono">${rateWindow}</span> 秒</strong>
+        <p>当前共配置 <strong>${config.nim_api_keys.length}</strong> 个 Key${providerSummary ? `（${providerSummary}）` : ""}，理论合并配额约 <strong>${totalQuota}</strong> 次/分钟。已过期、被上游禁用或冷却中的 Key 不参与轮询。</p>
         <p class="banner-secure">${ICONS.shield}<span>Key 写入用户配置目录下独立的 <code>secrets.json</code>（仅当前用户可读，Unix 自动 chmod 600），不写入项目仓库，亦不上传任何远程服务。</span></p>
       </div>
     </div>
@@ -1269,13 +1454,42 @@ function renderKeys(): string {
   `;
 }
 
+/// HTML fragment for picking a provider. Renders as a row of pill
+/// buttons (rather than a `<select>`) so the user can see all three
+/// options at once and read the description of the active one.
+function providerPicker(idPrefix: string, value: ProviderKind): string {
+  const meta = PROVIDERS[value];
+  const buttons = PROVIDER_KINDS.map((kind) => {
+    const m = PROVIDERS[kind];
+    const active = kind === value ? "active" : "";
+    return `<button type="button" class="provider-pill ${active}" data-provider-pick="${idPrefix}" data-provider="${kind}">${escapeHtml(m.label)}</button>`;
+  }).join("");
+  return `
+    <div class="provider-picker" data-provider-id="${idPrefix}">
+      <div class="provider-pill-row">${buttons}</div>
+      <div class="provider-desc">${escapeHtml(meta.description)}</div>
+    </div>
+  `;
+}
+
 function renderSingleAddForm(): string {
+  const meta = PROVIDERS[singleAdd.provider];
+  const keyHint =
+    singleAdd.provider === "nim" ? "必填，nvapi- 开头" : "必填，原样填写上游签发的 Key";
   return `
     <div class="add-form">
       <label class="field">
-        <span>API Key 值 <em class="hint-inline">必填，nvapi- 开头</em></span>
+        <span>端点类型 <em class="hint-inline">选择上游协议</em></span>
+        ${providerPicker("addProvider", singleAdd.provider)}
+      </label>
+      <label class="field">
+        <span>端点 URL <em class="hint-inline">${meta.defaultBaseUrl ? "可留空使用默认" : "必填"}</em></span>
+        <input id="addBaseUrl" type="text" placeholder="${escapeHtml(meta.placeholder)}" value="${escapeHtml(singleAdd.baseUrl)}" />
+      </label>
+      <label class="field">
+        <span>API Key 值 <em class="hint-inline">${keyHint}</em></span>
         <div class="input-group">
-          <input id="addValue" type="${showToken ? "text" : "password"}" autocomplete="off" placeholder="nvapi-xxxxxxxxxxxxxxxx" value="${escapeHtml(singleAdd.value)}" />
+          <input id="addValue" type="${showToken ? "text" : "password"}" autocomplete="off" placeholder="${escapeHtml(meta.keyPlaceholder)}" value="${escapeHtml(singleAdd.value)}" />
           <button id="addToggle" class="btn-icon" type="button" aria-label="切换显示" title="${showToken ? "隐藏" : "显示"}">${showToken ? ICONS.eyeOff : ICONS.eye}</button>
         </div>
       </label>
@@ -1298,11 +1512,22 @@ function renderSingleAddForm(): string {
 }
 
 function renderBatchAddForm(): string {
+  const meta = PROVIDERS[batchAdd.provider];
+  const placeholderKey = meta.keyPlaceholder;
+  const placeholder = `${placeholderKey}\n${placeholderKey.replace("xxx", "yyy")}\n# 这一行会被忽略`;
   return `
     <div class="add-form">
       <label class="field">
+        <span>端点类型 <em class="hint-inline">本批次 Key 共用此协议</em></span>
+        ${providerPicker("batchProvider", batchAdd.provider)}
+      </label>
+      <label class="field">
+        <span>端点 URL <em class="hint-inline">${meta.defaultBaseUrl ? "可留空使用默认" : "必填"}</em></span>
+        <input id="batchBaseUrl" type="text" placeholder="${escapeHtml(meta.placeholder)}" value="${escapeHtml(batchAdd.baseUrl)}" />
+      </label>
+      <label class="field">
         <span>批量 API Key <em class="hint-inline">每行一个，# 开头视为注释</em></span>
-        <textarea id="batchValues" rows="6" class="keys-textarea" placeholder="nvapi-xxxxxxxxxxxxxxxx&#10;nvapi-yyyyyyyyyyyyyyyy&#10;# 这一行会被忽略">${escapeHtml(batchAdd.values)}</textarea>
+        <textarea id="batchValues" rows="6" class="keys-textarea" placeholder="${escapeHtml(placeholder)}">${escapeHtml(batchAdd.values)}</textarea>
       </label>
       <div class="form-grid two">
         <label class="field"><span>共享备注 <em class="hint-inline">可选 · 应用到所有导入项</em></span><input id="batchLabel" placeholder="例如：team-a" value="${escapeHtml(batchAdd.labelPrefix)}" /></label>
@@ -1345,11 +1570,16 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
   const ratio = limit > 0 ? Math.min(1, recent / limit) : 0;
   const fillCls = ratio >= 0.9 ? "danger" : ratio >= 0.6 ? "warn" : "";
   const widthPct = (ratio * 100).toFixed(1);
+  const provider = (k.provider ?? "nim") as ProviderKind;
+  const providerMeta = PROVIDERS[provider];
+  const baseUrl = effectiveBaseUrl(provider, k.base_url);
+  const providerBadge = `<span class="badge badge-provider provider-${provider}">${escapeHtml(providerMeta.short)}</span>`;
   return `
     <div class="key-card managed state-${stateNorm} expiry-${expiry.tone}">
       <div class="key-card-head">
         <div class="key-id-row">
           <span class="key-num">#${index + 1}</span>
+          ${providerBadge}
           ${stateBadge}
         </div>
         <div class="key-actions">
@@ -1362,6 +1592,10 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
         <div class="key-value-actions">
           ${copyButton(k.value, "key_" + k.id)}
         </div>
+      </div>
+      <div class="key-endpoint-row" title="${escapeHtml(baseUrl)}">
+        <span class="key-endpoint-label">端点</span>
+        <code class="key-endpoint selectable">${escapeHtml(baseUrl)}</code>
       </div>
       <dl class="key-attrs">
         <div><dt>备注</dt><dd>${k.label ? escapeHtml(k.label) : '<span class="muted">未填写</span>'}</dd></div>
@@ -1385,6 +1619,7 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
 }
 
 function renderEditCard(k: NimApiKey): string {
+  const meta = PROVIDERS[editForm.provider];
   return `
     <div class="key-card managed editing">
       <div class="key-card-head">
@@ -1394,6 +1629,14 @@ function renderEditCard(k: NimApiKey): string {
           <button id="editSave" class="btn-primary" type="button" data-edit-save="${escapeHtml(k.id)}">保存</button>
         </div>
       </div>
+      <label class="field">
+        <span>端点类型</span>
+        ${providerPicker("editProvider", editForm.provider)}
+      </label>
+      <label class="field">
+        <span>端点 URL <em class="hint-inline">${meta.defaultBaseUrl ? "可留空使用默认" : "必填"}</em></span>
+        <input id="editBaseUrl" type="text" placeholder="${escapeHtml(meta.placeholder)}" value="${escapeHtml(editForm.baseUrl)}" />
+      </label>
       <label class="field">
         <span>API Key 值</span>
         <div class="input-group">
@@ -1430,13 +1673,25 @@ function combobox(id: string, value: string, placeholder: string): string {
 function renderModels(): string {
   if (!config) return "";
   const hasKeys = config.nim_api_keys.length > 0;
+  // When every configured key is Anthropic-compat we can't auto-fetch
+  // a catalog (no /v1/models endpoint upstream), so the dropdown
+  // becomes a free-text input. Make that explicit so users don't
+  // wonder why nothing's loading.
+  const onlyAnthropic =
+    hasKeys &&
+    config.nim_api_keys.every(
+      (k) => ((k.provider ?? "nim") as ProviderKind) === "anthropic_compat",
+    );
   let modelsHint: string;
   if (models.length > 0) {
-    modelsHint = `已加载 ${models.length} 个 NVIDIA NIM 模型，每 30 分钟自动刷新一次。可点击下拉或直接输入过滤。`;
+    modelsHint = `已加载 ${models.length} 个上游模型，每 30 分钟自动刷新一次。可点击下拉或直接输入过滤。Anthropic 兼容端点不会出现在此处，请直接手动输入模型 ID。`;
   } else if (!hasKeys) {
-    modelsHint = "尚未配置 API Key，无法拉取模型列表。先在「API Keys」页面添加 nvapi- Key 后软件会自动获取。";
+    modelsHint = "尚未配置 API Key，无法拉取模型列表。先在「API Keys」页面添加 Key 后软件会自动获取。";
+  } else if (onlyAnthropic) {
+    modelsHint =
+      "当前仅配置 Anthropic 兼容 Key — 这类上游不暴露模型目录，请手动填写模型 ID（例如 claude-sonnet-4-5、glm-4.6、deepseek-chat 等）。";
   } else {
-    modelsHint = "正在自动拉取 NVIDIA NIM 模型列表（首次启动可能需要数秒）。也可以手动输入模型 ID。";
+    modelsHint = "正在自动拉取上游模型列表（首次启动可能需要数秒）。也可以手动输入模型 ID。";
   }
   return `
     <header class="page-header">
@@ -1997,6 +2252,9 @@ function bindKeysPage() {
   byId<HTMLInputElement>("addValue")?.addEventListener("input", (e) => {
     singleAdd.value = (e.target as HTMLInputElement).value;
   });
+  byId<HTMLInputElement>("addBaseUrl")?.addEventListener("input", (e) => {
+    singleAdd.baseUrl = (e.target as HTMLInputElement).value;
+  });
   byId<HTMLInputElement>("addLabel")?.addEventListener("input", (e) => {
     singleAdd.label = (e.target as HTMLInputElement).value;
   });
@@ -2020,6 +2278,9 @@ function bindKeysPage() {
   byId<HTMLTextAreaElement>("batchValues")?.addEventListener("input", (e) => {
     batchAdd.values = (e.target as HTMLTextAreaElement).value;
   });
+  byId<HTMLInputElement>("batchBaseUrl")?.addEventListener("input", (e) => {
+    batchAdd.baseUrl = (e.target as HTMLInputElement).value;
+  });
   byId<HTMLInputElement>("batchLabel")?.addEventListener("input", (e) => {
     batchAdd.labelPrefix = (e.target as HTMLInputElement).value;
   });
@@ -2034,6 +2295,35 @@ function bindKeysPage() {
   byId<HTMLButtonElement>("batchCancel")?.addEventListener("click", closeAddPanel);
   byId<HTMLButtonElement>("batchSubmit")?.addEventListener("click", () => {
     void submitBatchImport();
+  });
+
+  // Provider pill bindings — clicking a pill switches the active
+  // provider for the form it lives in. Wire them up generically by
+  // looking at `data-provider-pick` (which form) and `data-provider`
+  // (the new value). We re-render so the description text and
+  // base_url placeholder track the selection.
+  document.querySelectorAll<HTMLButtonElement>("button[data-provider-pick]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.providerPick;
+      const provider = btn.dataset.provider as ProviderKind | undefined;
+      if (!target || !provider) return;
+      if (target === "addProvider") {
+        singleAdd.provider = provider;
+        // If the user hadn't typed a custom URL, prefill the new
+        // provider's default so the form is usable in one click.
+        if (!singleAdd.baseUrl.trim()) {
+          singleAdd.baseUrl = "";
+        }
+      } else if (target === "batchProvider") {
+        batchAdd.provider = provider;
+        if (!batchAdd.baseUrl.trim()) {
+          batchAdd.baseUrl = "";
+        }
+      } else if (target === "editProvider") {
+        editForm.provider = provider;
+      }
+      render();
+    });
   });
 
   bindManagedKeyControls();
@@ -2053,6 +2343,9 @@ function bindManagedKeyControls() {
 
   byId<HTMLInputElement>("editValue")?.addEventListener("input", (e) => {
     editForm.value = (e.target as HTMLInputElement).value;
+  });
+  byId<HTMLInputElement>("editBaseUrl")?.addEventListener("input", (e) => {
+    editForm.baseUrl = (e.target as HTMLInputElement).value;
   });
   byId<HTMLInputElement>("editLabel")?.addEventListener("input", (e) => {
     editForm.label = (e.target as HTMLInputElement).value;

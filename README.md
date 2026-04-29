@@ -2,7 +2,9 @@
 
 # CCNim
 
-基于 **NVIDIA NIM** 的 Claude Code / VSCode 扩展免费本地代理。
+Claude Code / VSCode 扩展的本地多端点代理：默认主推免费 **NVIDIA NIM**，
+也支持任意 **OpenAI 兼容**（DeepSeek、Moonshot、OpenRouter、自建 vLLM…）
+和 **Anthropic 兼容**（Claude 官方、智谱、DeepSeek anthropic 接口…）端点。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-24c8db.svg?style=for-the-badge&logo=tauri)](https://tauri.app)
@@ -11,7 +13,7 @@
 简体中文 · [English](README.en.md)
 
 一个 Rust + Tauri 桌面应用：在本机起一个 Anthropic 兼容代理，
-上游对接 NVIDIA NIM（每个 Key 免费 40 次/分钟），自动多 Key 轮询，
+任意条数的上游 Key 进同一个池子按健康度自动轮询，
 一键把 Claude Code CLI、Continue、Cline、RooCode 配置到本地端点。
 
 <img src="pic.png" width="700" alt="CCNim 截图">
@@ -20,11 +22,16 @@
 
 ## 快速开始
 
-1. 在 [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys)
-   申请一个免费的 NIM Key（以 `nvapi-` 开头）。
+1. 准备至少一个上游 Key：
+   - **NVIDIA NIM**（免费 40 次/分钟）：在
+     [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys)
+     申请，Key 以 `nvapi-` 开头；
+   - **OpenAI 兼容**：DeepSeek、Moonshot、OpenRouter、Groq、自建 vLLM 等都行；
+   - **Anthropic 兼容**：Claude 官方、智谱 BigModel anthropic 接口等。
 2. 到 **[Releases 页面](https://github.com/HG-ha/ccnim/releases/latest)**
    下载最新的 Windows 安装包（`CCNim_*_x64-setup.exe`），双击安装。
-3. 打开应用，把 Key 粘进去，点 **启动代理**。
+3. 打开应用，在 **API Keys** 页选择端点类型（NIM / OpenAI 兼容 /
+   Anthropic 兼容）、填写 base URL、粘贴 Key，然后点 **启动代理**。
 4. 切到 **IDE 接入** 页一键写入 VSCode / Cursor / Windsurf 的配置，
    或者点 **打开预配置终端** 直接跑 `claude`。
 
@@ -36,11 +43,16 @@
 - **本地 Anthropic 兼容代理**：完整支持 `/v1/messages`（含 SSE 流式
   输出）、`/v1/messages/count_tokens`、`/v1/models`。Claude Code、
   VSCode 官方插件等只要把 `ANTHROPIC_BASE_URL` 指过来就能用。
-- **多 Key 轮询 + 限流防护**：每个 Key 免费 40 次/分钟，应用按健康
-  状态、并发数、最近窗口用量自动选 Key；遇到 429 / 401 自动冷却或
-  禁用，仪表盘实时显示每个 Key 的状态。
+- **多端点 / 多 Key 统一调度**：每个 Key 单独选择端点类型和上游
+  URL，所有 Key 进同一个池子按健康度轮询。NIM / OpenAI 兼容走
+  `chat/completions` + Anthropic SSE 翻译；Anthropic 兼容直接透传，
+  保留 thinking、tool_use 等原生能力。
+- **限流防护**：每个 Key 默认 40 次/分钟，按健康状态、并发数、最近
+  窗口用量自动选 Key；遇到 429 / 401 自动冷却或禁用，仪表盘实时
+  显示每个 Key 的状态、所属端点和上游 URL。
 - **模型映射**：把 Anthropic 的 Opus / Sonnet / Haiku 映射到任意
-  NIM 模型，留空走默认模型。模型列表每 30 分钟从 NIM 自动拉取。
+  上游模型，留空走默认模型。NIM / OpenAI 兼容上游会每 30 分钟自动
+  拉取模型目录；Anthropic 兼容上游不暴露目录，可手动输入模型 ID。
 - **IDE 一键接入**：自动扫描本机 VSCode 系列 IDE（VSCode / Cursor /
   Windsurf 等）的 `settings.json`，一键写入
   `claudeCode.environmentVariables`。
@@ -57,7 +69,7 @@
 | 文件 | 内容 |
 | --- | --- |
 | `%APPDATA%\dev\ccnim\CCNim\config\config.json` | 主机/端口、模型映射、限流参数等非敏感配置 |
-| `%APPDATA%\dev\ccnim\CCNim\config\secrets.json` | Auth Token + NIM API Keys，仅当前用户可读 |
+| `%APPDATA%\dev\ccnim\CCNim\config\secrets.json` | Auth Token + 全部上游 API Keys（含端点类型 / base URL），仅当前用户可读 |
 
 两个文件都不会进入项目目录，也不会被上传。
 

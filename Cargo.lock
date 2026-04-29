@@ -2767,6 +2767,7 @@ dependencies = [
  "app-config",
  "async-stream",
  "axum",
+ "bytes",
  "futures-util",
  "nim-client",
  "proxy-core",

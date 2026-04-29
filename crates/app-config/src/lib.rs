@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use proxy_core::ModelMapping;
+use proxy_core::{normalize_base_url, ModelMapping, ProviderKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,12 +13,23 @@ use uuid::Uuid;
 /// lets the local proxy reject completely unauthenticated callers.
 const DEFAULT_AUTH_TOKEN: &str = "freecc";
 
-/// One configured NVIDIA NIM API key plus user-attached metadata.
+/// One configured upstream credential — a key/secret plus the upstream
+/// base URL it talks to and the protocol family ("provider") it belongs
+/// to. The GUI calls this an "API Key" for short.
 ///
 /// `id` is a stable per-key identifier (UUID v4 string) that the GUI uses for
 /// edit/delete operations; the secret material itself stays in `value`.
 /// `label` is a free-form note (e.g. "personal account / dev"). `expires_at`
 /// is unix-epoch seconds, `None` means "never expires".
+///
+/// `provider` selects the wire protocol. `base_url` overrides the canonical
+/// upstream URL for that provider (useful for OpenAI-compatible third-party
+/// hosts and self-hosted deployments). When `base_url` is empty, the proxy
+/// falls back to [`ProviderKind::default_base_url`].
+///
+/// Note: the type is named `NimApiKey` for source-level backwards
+/// compatibility with the original NIM-only build. New callers are
+/// encouraged to use the alias [`UpstreamKey`] instead.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NimApiKey {
     pub id: String,
@@ -27,7 +38,21 @@ pub struct NimApiKey {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// Protocol family. Defaults to NIM for backwards compatibility with
+    /// pre-multi-provider configs.
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// Upstream base URL. Empty means "use the default for this provider".
+    /// Stored verbatim (modulo trailing-slash normalization on save) so we
+    /// don't surprise users by mutating their input.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
 }
+
+/// Modern alias for the structured upstream key. New code should prefer
+/// this name; the [`NimApiKey`] alias is kept to avoid churning every
+/// import site at once.
+pub type UpstreamKey = NimApiKey;
 
 impl NimApiKey {
     pub fn from_value(value: impl Into<String>) -> Self {
@@ -36,6 +61,19 @@ impl NimApiKey {
             value: value.into(),
             label: None,
             expires_at: None,
+            provider: ProviderKind::default(),
+            base_url: String::new(),
+        }
+    }
+
+    /// Resolve the effective base URL for this key — user-supplied value
+    /// if non-empty, otherwise the canonical default for the configured
+    /// provider. The returned string never has a trailing `/`.
+    pub fn effective_base_url(&self) -> String {
+        if self.base_url.trim().is_empty() {
+            normalize_base_url(self.provider.default_base_url())
+        } else {
+            normalize_base_url(&self.base_url)
         }
     }
 }
@@ -316,12 +354,20 @@ fn describe_secrets_result(result: &Result<Option<SecretsFile>>) -> String {
     }
 }
 
-/// Custom deserializer that accepts both the legacy plaintext shape
-/// (`["nvapi-x", "nvapi-y"]`) and the new structured shape
-/// (`[{ "id": "...", "value": "nvapi-x", "label": "...", "expires_at": ... }, ...]`).
+/// Custom deserializer that accepts every shape we've ever shipped:
 ///
-/// Plaintext entries are upgraded in-place by minting a fresh UUID for each.
-/// Structured entries flow through unchanged.
+///   1. Legacy plaintext: `["nvapi-x", "nvapi-y"]`. Each becomes a NIM
+///      key with a fresh UUID and empty base_url (so the runtime falls
+///      back to the canonical NIM endpoint).
+///   2. Pre-multi-provider structured: `[{ "id", "value", "label"?,
+///      "expires_at"? }]` without `provider`. We default the provider
+///      to NIM so existing configs keep working unchanged.
+///   3. Current structured: same as (2) plus `"provider"` and
+///      `"base_url"`.
+///
+/// Plaintext entries get a fresh UUID. Structured entries flow through
+/// unchanged save for the implicit `ProviderKind::default()` fill-in
+/// done by serde when the field is missing (see `#[serde(default)]`).
 fn deserialize_nim_keys<'de, D>(deserializer: D) -> Result<Vec<NimApiKey>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -384,6 +430,9 @@ mod tests {
         assert_eq!(parsed.nim_api_keys[0].value, "nvapi-aaa");
         assert!(parsed.nim_api_keys[0].label.is_none());
         assert!(parsed.nim_api_keys[0].expires_at.is_none());
+        // Legacy entries assume NIM provider so existing configs keep working.
+        assert_eq!(parsed.nim_api_keys[0].provider, ProviderKind::Nim);
+        assert!(parsed.nim_api_keys[0].base_url.is_empty());
         // Upgraded entries should have been assigned synthetic UUIDs.
         assert!(!parsed.nim_api_keys[0].id.is_empty());
         assert_ne!(parsed.nim_api_keys[0].id, parsed.nim_api_keys[1].id);
@@ -399,6 +448,7 @@ mod tests {
         assert_eq!(parsed.nim_api_keys[0].id, "k1");
         assert_eq!(parsed.nim_api_keys[0].label.as_deref(), Some("primary"));
         assert_eq!(parsed.nim_api_keys[0].expires_at, Some(4102444800));
+        assert_eq!(parsed.nim_api_keys[0].provider, ProviderKind::Nim);
         assert_eq!(parsed.nim_api_keys[1].id, "k2");
         assert!(parsed.nim_api_keys[1].label.is_none());
         assert!(parsed.nim_api_keys[1].expires_at.is_none());
@@ -415,5 +465,37 @@ mod tests {
         assert_eq!(parsed.nim_api_keys[0].value, "nvapi-legacy");
         assert!(parsed.nim_api_keys[0].label.is_none());
         assert_eq!(parsed.nim_api_keys[1].label.as_deref(), Some("secondary"));
+    }
+
+    #[test]
+    fn deserializes_multi_provider_array() {
+        let raw = r#"{ "nim_api_keys": [
+            { "id": "k1", "value": "nvapi-aaa", "provider": "nim" },
+            { "id": "k2", "value": "sk-deepseek-xyz", "provider": "openai_compat",
+              "base_url": "https://api.deepseek.com" },
+            { "id": "k3", "value": "sk-ant-zhipu", "provider": "anthropic_compat",
+              "base_url": "https://open.bigmodel.cn/api/anthropic" }
+        ] }"#;
+        let parsed: Wrapper = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.nim_api_keys.len(), 3);
+        assert_eq!(parsed.nim_api_keys[0].provider, ProviderKind::Nim);
+        assert_eq!(parsed.nim_api_keys[1].provider, ProviderKind::OpenaiCompat);
+        assert_eq!(parsed.nim_api_keys[1].base_url, "https://api.deepseek.com");
+        assert_eq!(
+            parsed.nim_api_keys[2].provider,
+            ProviderKind::AnthropicCompat
+        );
+    }
+
+    #[test]
+    fn effective_base_url_falls_back_to_provider_default() {
+        let nim = NimApiKey::from_value("nvapi-x");
+        assert_eq!(
+            nim.effective_base_url(),
+            "https://integrate.api.nvidia.com/v1"
+        );
+        let mut custom = NimApiKey::from_value("nvapi-x");
+        custom.base_url = "https://my.example.com/v1/".to_string();
+        assert_eq!(custom.effective_base_url(), "https://my.example.com/v1");
     }
 }

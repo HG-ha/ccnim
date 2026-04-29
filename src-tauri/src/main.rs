@@ -141,7 +141,13 @@ fn read_diagnostic_log() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn fetch_nim_models() -> Result<proxy_core::NimModelList, String> {
+async fn fetch_nim_models(
+    provider: Option<proxy_core::ProviderKind>,
+) -> Result<proxy_core::NimModelList, String> {
+    let provider = provider.unwrap_or(proxy_core::ProviderKind::Nim);
+    if matches!(provider, proxy_core::ProviderKind::AnthropicCompat) {
+        return Err("Anthropic 兼容上游不暴露模型目录，请在端点配置中手动填写模型名".to_string());
+    }
     let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
     let key_pool = KeyPool::new(
         key_pool_entries(&config.nim_api_keys),
@@ -149,7 +155,10 @@ async fn fetch_nim_models() -> Result<proxy_core::NimModelList, String> {
         std::time::Duration::from_secs(config.rate_window_secs),
     );
     let client = NimClient::new(key_pool).map_err(|e| e.to_string())?;
-    client.list_models().await.map_err(|e| e.to_string())
+    client
+        .list_models(provider)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
