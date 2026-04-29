@@ -165,111 +165,114 @@ fn open_claude_terminal(cwd: String) -> Result<(), String> {
 }
 #[tauri::command]
 fn open_claude_desktop() -> Result<(), String> {
- let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
- let proxy_url = format!("http://{}:{}", config.host, config.port);
- 
- // 配置 Claude Desktop 的代理设置
- configure_claude_desktop_proxy(&proxy_url)?;
- 
- // 然后打开应用
- #[cfg(target_os = "windows")]
- {
- Command::new("cmd")
- .arg("/c")
- .arg("start")
- .arg("\"Claude\"")
- .spawn()
- .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
- }
- 
- #[cfg(target_os = "macos")]
- {
- Command::new("open")
- .arg("-a")
- .arg("Claude")
- .spawn()
- .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
- }
- 
- #[cfg(all(unix, not(target_os = "macos")))]
- {
- Command::new("xdg-open")
- .arg("claude://")
- .spawn()
- .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
- }
- 
- Ok(())
+    let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
+    let proxy_url = format!("http://{}:{}", config.host, config.port);
+
+    // 配置 Claude Desktop 的代理设置
+    configure_claude_desktop_proxy(&proxy_url)?;
+
+    // 然后打开应用
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .arg("/c")
+            .arg("start")
+            .arg("\"Claude\"")
+            .spawn()
+            .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-a")
+            .arg("Claude")
+            .spawn()
+            .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg("claude://")
+            .spawn()
+            .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
+    }
+
+    Ok(())
 }
 
 /// 配置 Claude Desktop 的代理设置
 fn configure_claude_desktop_proxy(proxy_url: &str) -> Result<(), String> {
- use std::fs;
- use std::io::{Read, Write};
- 
- // 获取 Claude Desktop 配置目录
- let config_dir = get_claude_config_dir()?;
- let settings_path = config_dir.join("settings.json");
- 
- // 确保目录存在
- fs::create_dir_all(&config_dir).map_err(|e| format!("无法创建配置目录：{e}"))?;
- 
- // 读取现有配置或创建新配置
- let mut config: serde_json::Value = if settings_path.exists() {
- let mut file = fs::File::open(&settings_path).map_err(|e| format!("无法读取配置：{e}"))?;
- let mut contents = String::new();
- file.read_to_string(&mut contents).map_err(|e| format!("无法读取配置：{e}"))?;
- serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
- } else {
- serde_json::json!({})
- };
- 
- // 设置代理环境变量
- if let Some(env) = config.get_mut("environment").and_then(|v| v.as_object_mut()) {
- env.insert("HTTP_PROXY".to_string(), serde_json::json!(proxy_url));
- env.insert("HTTPS_PROXY".to_string(), serde_json::json!(proxy_url));
- } else {
- config["environment"] = serde_json::json!({
- "HTTP_PROXY": proxy_url,
- "HTTPS_PROXY": proxy_url
- });
- }
- 
- // 写回配置文件
- let mut file = fs::File::create(&settings_path).map_err(|e| format!("无法写入配置：{e}"))?;
- let contents = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败：{e}"))?;
- file.write_all(contents.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
- 
- Ok(())
+    use std::fs;
+    use std::io::{Read, Write};
+
+    // 获取 Claude Desktop 配置目录
+    let config_dir = get_claude_config_dir()?;
+    let settings_path = config_dir.join("settings.json");
+
+    // 确保目录存在
+    fs::create_dir_all(&config_dir).map_err(|e| format!("无法创建配置目录：{e}"))?;
+
+    // 读取现有配置或创建新配置
+    let mut config: serde_json::Value = if settings_path.exists() {
+        let mut file = fs::File::open(&settings_path).map_err(|e| format!("无法读取配置：{e}"))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| format!("无法读取配置：{e}"))?;
+        serde_json::from_str(&contents).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // 设置代理环境变量
+    if let Some(env) = config
+        .get_mut("environment")
+        .and_then(|v| v.as_object_mut())
+    {
+        env.insert("HTTP_PROXY".to_string(), serde_json::json!(proxy_url));
+        env.insert("HTTPS_PROXY".to_string(), serde_json::json!(proxy_url));
+    } else {
+        config["environment"] = serde_json::json!({
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url
+        });
+    }
+
+    // 写回配置文件
+    let mut file = fs::File::create(&settings_path).map_err(|e| format!("无法写入配置：{e}"))?;
+    let contents = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败：{e}"))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("写入失败：{e}"))?;
+
+    Ok(())
 }
 
 /// 获取 Claude Desktop 的配置目录
 fn get_claude_config_dir() -> Result<PathBuf, String> {
- #[cfg(target_os = "windows")]
- {
- let app_data = std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量")?;
- Ok(PathBuf::from(app_data).join("Claude"))
- }
- 
- #[cfg(target_os = "macos")]
- {
- let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量")?;
- Ok(PathBuf::from(home).join(".claude"))
- }
- 
- #[cfg(all(unix, not(target_os = "macos")))]
- {
- let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量")?;
- Ok(PathBuf::from(home).join(".config").join("claude"))
- }
- 
- #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
- {
- Err("当前平台不支持 Claude Desktop".to_string())
- }
+    #[cfg(target_os = "windows")]
+    {
+        let app_data = std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量")?;
+        Ok(PathBuf::from(app_data).join("Claude"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量")?;
+        Ok(PathBuf::from(home).join(".claude"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量")?;
+        Ok(PathBuf::from(home).join(".config").join("claude"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err("当前平台不支持 Claude Desktop".to_string())
+    }
 }
-
-
 
 fn user_home() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
@@ -394,7 +397,7 @@ fn main() {
             proxy_status,
             fetch_nim_models,
             open_claude_terminal,
- open_claude_desktop,
+            open_claude_desktop,
             read_diagnostic_log,
             scan_ides,
             apply_ide_settings,
