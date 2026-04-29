@@ -10,25 +10,36 @@
 //! is enough to redirect the extension to our local proxy — no per-IDE
 //! plugin glue, no DLLs, just a JSON edit.
 //!
-//! ## Why a hand-rolled JSONC stripper
+//! ## Platform support
 //!
-//! `settings.json` is JSONC — JSON with `//` and `/* */` comments and trailing
-//! commas. `serde_json` rejects both. Pulling in a JSONC parser dependency just
-//! to set one key is overkill, so we strip comments / trailing commas via a
-//! 100-line state machine (the only correctness-critical part is *not*
-//! treating `//` inside string literals as a comment, which is unit-tested
-//! below). On write we re-serialize as standard JSON, which means inline
-//! comments are lost — that's why we always copy the original to
-//! `settings.json.bak` first and report it back to the UI.
+//! On mobile platforms (Android/iOS) this module returns an empty list because
+//! VSCode extensions cannot be installed. Users should use the terminal launch
+//! flow instead.
 
 use std::path::Path;
 
 use directories::BaseDirs;
 use serde::Serialize;
 
+/// Early exit on mobile platforms — no VSCode extensions available.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn scan_ides() -> Vec<IdeProfile> {
+    Vec::new()
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn apply_settings(
+    _ide_id: &str,
+    _base_url: &str,
+    _auth_token: &str,
+) -> Result<IdeApplyReport, String> {
+    Err("移动平台不支持 IDE 配置".to_string())
+}
+
 /// Static registry of supported VSCode-family editors. The third element is
 /// the directory name under the platform-appropriate user config dir
 /// (`%APPDATA%` / `~/Library/Application Support` / `~/.config`).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const KNOWN_IDES: &[(&str, &str, &str)] = &[
     ("vscode", "Visual Studio Code", "Code"),
     ("vscode-insiders", "VSCode Insiders", "Code - Insiders"),

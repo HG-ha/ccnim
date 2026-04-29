@@ -16,3 +16,8 @@ src-tauri/gen/
 # Local env / runtime
 .env
 *.log
+
+# nimcode
+.nimcode/
+.sandbox-home/
+.sandbox-tmp/

@@ -421,6 +421,16 @@ async function openClaudeTerminal() {
   }
 }
 
+async function openClaudeDesktopApp() {
+ await save(true);
+ try {
+ await invoke("open_claude_desktop");
+ toast("已尝试打开 Claude Desktop", "success");
+ } catch (error) {
+ toast(`打开失败：${error}`, "error");
+ }
+}
+
 async function refreshDiagnostic() {
   try {
     diagnosticLog = await invoke<string>("read_diagnostic_log");
@@ -1713,6 +1723,7 @@ function renderIDE(): string {
       </div>
       <div class="header-actions">
         <button id="openClaude" class="btn-primary" ${proxyStatus?.running ? "" : "disabled title='请先启动代理'"}>打开预配置终端</button>
+ <button id="openClaudeDesktop" class="btn-secondary" ${proxyStatus?.running ? "" : "disabled title='请先启动代理'"}>打开 Claude Desktop</button>
       </div>
     </header>
 
@@ -1940,6 +1951,7 @@ function bind() {
   byId<HTMLButtonElement>("sidebarToggle")?.addEventListener("click", toggleSidebar);
   byId<HTMLButtonElement>("save")?.addEventListener("click", () => save());
   byId<HTMLButtonElement>("openClaude")?.addEventListener("click", openClaudeTerminal);
+ byId<HTMLButtonElement>("openClaudeDesktop")?.addEventListener("click", openClaudeDesktopApp);
   byId<HTMLButtonElement>("diagRefresh")?.addEventListener("click", refreshDiagnostic);
   byId<HTMLButtonElement>("tokToggle")?.addEventListener("click", () => {
     showToken = !showToken;

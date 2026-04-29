@@ -4,42 +4,59 @@ name: Release
 # CCNim 发布流水线 —— 用法备忘
 # ============================================================================
 # 触发方式：
-#   - 推送 `vX.Y.Z` 形式的 tag（推荐）
-#   - 在 Actions 页手动 dispatch
+# - 推送 `vX.Y.Z` 形式的 tag（推荐）
+# - 在 Actions 页手动 dispatch
 #
 # 流水线会做的事：
-#   1. 在 Windows runner 上 build 前端（vite）+ Rust（tauri build）
-#   2. tauri-action 用 secrets 里的私钥给 NSIS 安装包做 minisign 签名
-#   3. 生成 `latest.json`（包含版本号 / 下载链接 / 签名串），客户端的
-#      `tauri-plugin-updater` 就靠这个文件发现新版本
-#   4. 把 `*.exe`、`*.exe.sig`、`latest.json` 一起发到 GitHub Release
+# 1. 在 Windows runner 上 build 前端（vite）+ Rust（tauri build）
+#    → 生成 NSIS 安装包（.exe）
+# 2. 在 macOS runner 上 build 前端 + Rust
+#    → 生成 DMG 安装包（.dmg）和 .app bundle
+# 3. tauri-action 用 secrets 里的私钥给安装包做 minisign 签名
+# 4. 生成 `latest.json`（包含版本号 / 下载链接 / 签名串），客户端的
+#    `tauri-plugin-updater` 就靠这个文件发现新版本
+# 5. 把所有平台的安装包和 `latest.json` 一起发到 GitHub Release
 #
 # ----------------------------------------------------------------------------
 # 必需的仓库 Secrets（Settings → Secrets and variables → Actions）
 # ----------------------------------------------------------------------------
-#   TAURI_SIGNING_PRIVATE_KEY            私钥原文，base64 整段。
-#                                        本地用 `npx tauri signer generate
-#                                        --ci -p <密码> -w <文件路径>` 生成。
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   生成私钥时设的密码。
+# TAURI_SIGNING_PRIVATE_KEY 私钥原文，base64 整段。
+# 本地用 `npx tauri signer generate
+# --ci -p <密码> -w <文件路径>` 生成。
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD 生成私钥时设的密码。
 #
-# ⚠️  私钥一旦丢失，后续就无法签出能被现有客户端接受的更新包；老用户的
-#     自动更新会卡死，只能升级 `src-tauri/tauri.conf.json` 里的 pubkey
-#     重新发布并提示用户手动重装。请把私钥同时备份到密码管理器。
+# ⚠️ 私钥一旦丢失，后续就无法签出能被现有客户端接受的更新包；老用户的
+# 自动更新会卡死，只能升级 `src-tauri/tauri.conf.json` 里的 pubkey
+# 重新发布并提示用户手动重装。请把私钥同时备份到密码管理器。
+#
+# ----------------------------------------------------------------------------
+# 可选的 macOS 代码签名 Secrets（需要 Apple Developer 账号）
+# ----------------------------------------------------------------------------
+# APPLE_SIGNING_IDENTITY 代码签名证书名称，如 "Developer ID Application: Your Name"
+# APPLE_ID  Apple ID（用于 notarization）
+# APPLE_PASSWORD  App Specific Password（从 Apple ID 页面生成）
+# APPLE_TEAM_ID   Apple Developer Team ID
+#
+# 如果不配置这些，打包出来的 .dmg 会提示 "应用来自不明开发者"，
+# 用户需要右键 → 打开才能运行。配置后可以自动 notarize（公证）。
 #
 # ----------------------------------------------------------------------------
 # 发布一个新版本的标准操作（本地执行）
 # ----------------------------------------------------------------------------
-#   1. 同步改三处版本号（必须保持一致，否则 updater 会算错）：
-#        - package.json                "version"
-#        - src-tauri/tauri.conf.json   "version"
-#        - src-tauri/Cargo.toml        [package].version
-#   2. git commit -am "release: vX.Y.Z"
-#      git tag vX.Y.Z
-#      git push origin main --tags
-#   3. 等这个 workflow 跑完（Actions 页能看到进度），Release 页面会自动
-#      出现新版本，里面附带 `*.exe`、`*.exe.sig`、`latest.json`
-#   4. 已经在用旧版本的用户：下次启动应用、或者手动点「检查更新」就会
-#      看到新版本横幅，点「立即安装」即可
+# 1. 同步改三处版本号（必须保持一致，否则 updater 会算错）：
+#    - package.json "version"
+#    - src-tauri/tauri.conf.json "version"
+#    - src-tauri/Cargo.toml [package].version
+# 2. git commit -am "release: vX.Y.Z"
+#    git tag vX.Y.Z
+#    git push origin main --tags
+# 3. 等这个 workflow 跑完（Actions 页能看到进度），Release 页面会自动
+#    出现新版本，里面附带：
+#    - Windows: `CCNim_*_x64-setup.exe` + `.sig`
+#    - macOS: `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel）
+#    - `latest.json`（更新元数据）
+# 4. 已经在用旧版本的用户：下次启动应用时会自动检测到此版本，或者
+#    点仪表盘右上角的「检查更新」按钮立即升级
 # ============================================================================
 
 on:
@@ -62,6 +79,8 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
+            args: ""
+          - platform: macos-latest
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -95,12 +114,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS 代码签名（可选，需要 Apple Developer 账号）
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "CCNim ${{ github.ref_name }}"
           releaseBody: |
-            从下方 Assets 下载 `CCNim_*_x64-setup.exe` 双击安装即可。
-
+            ## 下载说明
+            
+            ### Windows
+            下载 `CCNim_*_x64-setup.exe` 双击安装即可。
+            
+            ### macOS
+            下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac），
+            打开后将应用拖到 Applications 文件夹即可。
+            
             已安装旧版本的用户：下次启动应用时会自动检测到此版本，或者
             点仪表盘右上角的「检查更新」按钮立即升级。
           releaseDraft: false
