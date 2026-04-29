@@ -78,15 +78,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 显式 --bundles 单平台单格式：避免在 Linux 上同时产出
+          # CCNim_*.deb / cc-nim_*.deb / *.rpm / *.AppImage 一堆变体
+          # 触发 tauri-action 的去重 bug（"No artifacts were found"）。
+          # 同时 Linux 只保留 AppImage 也跟 updater 唯一支持的 Linux
+          # 格式对齐——用户那边 `tauri-plugin-updater` 也只认 AppImage。
           - platform: windows-latest
-            args: ""
+            args: "--bundles nsis"
           - platform: macos-latest
-            args: ""
+            args: "--bundles dmg"
           # Ubuntu 22.04 LTS — webkit2gtk-4.1 在 24.04 之后被移除/重命名，
           # tauri-action 默认链接 4.1，所以这里固定到 22.04 是最稳的选择。
-          # 产物默认包含 .AppImage / .deb；用户优先下载 .AppImage 即可。
           - platform: ubuntu-22.04
-            args: ""
+            args: "--bundles appimage"
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
@@ -156,8 +160,9 @@ jobs:
             可能被 Gatekeeper 拦截，右键「打开」一次即可。
             
             ### Linux
-            优先下载 `ccnim_*_amd64.AppImage`，`chmod +x` 后双击运行。
-            也可以用 `ccnim_*_amd64.deb` 安装到 Debian/Ubuntu 系统。
+            下载 `CCNim_*_amd64.AppImage`，`chmod +x` 后双击运行。
+            （AppImage 是自带运行时的便携格式，无需安装、不依赖系统包管理器，
+             也是 `tauri-plugin-updater` 在 Linux 唯一支持的自动更新格式。）
             
             已安装旧版本的用户：下次启动应用时会自动检测到此版本，或者
             点仪表盘右上角的「检查更新」按钮立即升级。
