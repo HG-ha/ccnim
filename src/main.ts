@@ -17,6 +17,15 @@ type NimApiKey = {
   provider?: ProviderKind;
   /// Empty / undefined means "use provider's default base URL".
   base_url?: string;
+  /// Whether this key is enabled.
+  enabled?: boolean;
+  /// Per-key model mapping. If undefined, falls back to global config.
+  model_mapping?: {
+    default_model?: string | null;
+    opus_model?: string | null;
+    sonnet_model?: string | null;
+    haiku_model?: string | null;
+  };
 };
 
 type AppConfig = {
@@ -182,12 +191,13 @@ const batchAdd = {
   baseUrl: "",
 };
 const editForm = {
-  value: "",
-  label: "",
-  expiresAt: "",
-  provider: "nim" as ProviderKind,
-  baseUrl: "",
-};
+    value: "",
+    label: "",
+    expiresAt: "",
+    provider: "nim" as ProviderKind,
+    baseUrl: "",
+    modelMapping: { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" },
+  };
 
 const appWindow = getCurrentWindow();
 
@@ -525,8 +535,8 @@ async function openClaudeTerminal() {
 async function openClaudeDesktopApp() {
  await save(true);
  try {
- await invoke("open_claude_desktop");
- toast("已尝试打开 Claude Desktop", "success");
+ const report = await invoke<string>("open_claude_desktop");
+        toast("配置文件已写入。\n\n后续步骤：\n1. 首次使用需要在 Claude Desktop 中启用开发者模式\n2. 打开 Claude Desktop → Help → Troubleshooting → Enable Developer Mode\n3. 重启 Claude Desktop\n4. 进入 Settings → Claude Code → Developer → Configure Third-party Inference\n5. 配置 Base URL 和 API Key，点击 Apply Locally", "success");
  } catch (error) {
  toast(`打开失败：${error}`, "error");
  }
@@ -722,6 +732,18 @@ function beginEditKey(id: string) {
   editForm.expiresAt = unixToDatetimeLocal(key.expires_at);
   editForm.provider = key.provider ?? "nim";
   editForm.baseUrl = key.base_url ?? "";
+  // Load model mapping if configured for this key
+  if (key.model_mapping) {
+    editForm.modelMapping = {
+      defaultModel: key.model_mapping.default_model || "",
+      opusModel: key.model_mapping.opus_model || "",
+      sonnetModel: key.model_mapping.sonnet_model || "",
+      haikuModel: key.model_mapping.haiku_model || "",
+    };
+  } else {
+    // Clear model mapping
+    editForm.modelMapping = { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" };
+  }
   editingKeyId = id;
   addPanel = null;
   render();
@@ -782,6 +804,22 @@ async function deleteKey(id: string) {
   }
   toast("已删除", "info");
   if (editingKeyId === id) editingKeyId = null;
+  render();
+}
+
+async function toggleKeyEnabled(id: string, enabled: boolean) {
+  if (!config) return;
+  const idx = config.nim_api_keys.findIndex((k) => k.id === id);
+  if (idx < 0) return;
+  config.nim_api_keys[idx].enabled = enabled;
+  if (!(await save(true))) {
+    // Revert on failure
+    config.nim_api_keys[idx].enabled = !enabled;
+    toast("保存失败，已恢复原状态", "error");
+    render();
+    return;
+  }
+  toast(enabled ? "已启用" : "已禁用", enabled ? "success" : "info");
   render();
 }
 
@@ -1498,7 +1536,7 @@ function renderSingleAddForm(): string {
         <label class="field">
           <span>到期时间 <em class="hint-inline">可选 · 留空表示永不过期</em></span>
           <div class="input-group">
-            <input id="addExpiry" type="datetime-local" value="${escapeHtml(singleAdd.expiresAt)}" />
+            <input id="addExpiry" type="datetime-local" ${singleAdd.expiresAt ? `value="${escapeHtml(singleAdd.expiresAt)}"` : ""} />
             <button id="addExpiryClear" class="btn-icon" type="button" aria-label="清除到期" title="清除">×</button>
           </div>
         </label>
@@ -1534,7 +1572,7 @@ function renderBatchAddForm(): string {
         <label class="field">
           <span>共享到期时间 <em class="hint-inline">可选 · 应用到所有导入项</em></span>
           <div class="input-group">
-            <input id="batchExpiry" type="datetime-local" value="${escapeHtml(batchAdd.expiresAt)}" />
+            <input id="batchExpiry" type="datetime-local" ${batchAdd.expiresAt ? `value="${escapeHtml(batchAdd.expiresAt)}"` : ""} />
             <button id="batchExpiryClear" class="btn-icon" type="button" aria-label="清除到期" title="清除">×</button>
           </div>
         </label>
@@ -1580,9 +1618,13 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
         <div class="key-id-row">
           <span class="key-num">#${index + 1}</span>
           ${providerBadge}
-          ${stateBadge}
-        </div>
-        <div class="key-actions">
+        ${stateBadge}
+        <label class="toggle-switch" title="启用/禁用此 Key">
+          <input type="checkbox" class="key-enabled-toggle" data-toggle-id="${escapeHtml(k.id)}" ${k.enabled ? 'checked' : ''} />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="key-actions">
           <button class="btn-icon" data-edit-id="${escapeHtml(k.id)}" type="button" title="编辑" aria-label="编辑">✎</button>
           <button class="btn-icon danger" data-delete-id="${escapeHtml(k.id)}" type="button" title="删除" aria-label="删除">×</button>
         </div>
@@ -1649,13 +1691,21 @@ function renderEditCard(k: NimApiKey): string {
         <label class="field">
           <span>到期时间 <em class="hint-inline">留空表示永不过期</em></span>
           <div class="input-group">
-            <input id="editExpiry" type="datetime-local" value="${escapeHtml(editForm.expiresAt)}" />
+            <input id="editExpiry" type="datetime-local" ${editForm.expiresAt ? `value="${escapeHtml(editForm.expiresAt)}"` : ""} />
             <button id="editExpiryClear" class="btn-icon" type="button" aria-label="清除到期" title="清除">×</button>
           </div>
-        </label>
-      </div>
-    </div>
-  `;
+</label>
+</div>
+<!-- Per-key model mapping -->
+<div class="form-grid two" style="margin-top:12px">
+  <label class="field"><span>默认模型</span><input id="editDefaultModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.defaultModel)}" /></label>
+  <label class="field"><span>Opus 模型</span><input id="editOpusModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.opusModel)}" /></label>
+  <label class="field"><span>Sonnet 模型</span><input id="editSonnetModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.sonnetModel)}" /></label>
+  <label class="field"><span>Haiku 模型</span><input id="editHaikuModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.haikuModel)}" /></label>
+</div>
+<p class="text-muted" style="margin-top:8px;font-size:12px">留空则使用全局默认配置。配置后该 Key 会使用自己的模型映射。</p>
+</div>
+`;
 }
 
 function combobox(id: string, value: string, placeholder: string): string {
@@ -1978,7 +2028,7 @@ function renderIDE(): string {
       </div>
       <div class="header-actions">
         <button id="openClaude" class="btn-primary" ${proxyStatus?.running ? "" : "disabled title='请先启动代理'"}>打开预配置终端</button>
- <button id="openClaudeDesktop" class="btn-secondary" ${proxyStatus?.running ? "" : "disabled title='请先启动代理'"}>打开 Claude Desktop</button>
+ <button id="openClaudeDesktop" class="btn-secondary" ${proxyStatus?.running ? "" : "disabled title='请先启动代理'"}>配置 Claude Desktop</button>
       </div>
     </header>
 
@@ -2336,6 +2386,13 @@ function bindManagedKeyControls() {
   document.querySelectorAll<HTMLButtonElement>("button[data-delete-id]").forEach((btn) => {
     btn.addEventListener("click", () => {
       void deleteKey(btn.dataset.deleteId ?? "");
+    });
+  });
+  // Bind toggle switch for enabling/disabling keys
+  document.querySelectorAll<HTMLInputElement>("input.key-enabled-toggle").forEach((toggle) => {
+    toggle.addEventListener("change", async () => {
+      const id = toggle.dataset.toggleId ?? "";
+      await toggleKeyEnabled(id, toggle.checked);
     });
   });
 

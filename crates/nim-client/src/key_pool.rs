@@ -35,6 +35,8 @@ pub struct KeyPoolEntry {
     /// equivalent) so the pool never needs to reach back into config
     /// to resolve defaults.
     pub base_url: String,
+    /// Whether this key is enabled.
+    pub enabled: bool,
 }
 
 impl KeyPoolEntry {
@@ -64,6 +66,8 @@ pub struct KeySnapshot {
     pub inflight: usize,
     pub recent_requests: usize,
     pub failure_count: usize,
+    /// Whether this key is enabled.
+    pub enabled: bool,
 }
 
 #[derive(Debug)]
@@ -79,6 +83,7 @@ struct KeyEntry {
     recent_requests: VecDeque<Instant>,
     cooldown_until: Option<Instant>,
     failure_count: usize,
+    enabled: bool,
 }
 
 impl KeyEntry {
@@ -95,6 +100,7 @@ impl KeyEntry {
             recent_requests: VecDeque::new(),
             cooldown_until: None,
             failure_count: 0,
+            enabled: entry.enabled,
         }
     }
 
@@ -115,6 +121,7 @@ impl KeyEntry {
             recent_requests: prev.recent_requests.clone(),
             cooldown_until: prev.cooldown_until,
             failure_count: prev.failure_count,
+            enabled: entry.enabled,
         }
     }
 }
@@ -184,7 +191,8 @@ impl KeyPool {
             .enumerate()
             .filter(|(_, entry)| {
                 predicate(entry)
-                    && entry.state == KeyState::Healthy
+                && entry.enabled
+                && entry.state == KeyState::Healthy
                     && entry.recent_requests.len() < self.rate_limit
             })
             .min_by_key(|(_, entry)| (entry.inflight, entry.recent_requests.len()))
@@ -272,6 +280,7 @@ impl KeyPool {
                     inflight: entry.inflight,
                     recent_requests: entry.recent_requests.len(),
                     failure_count: entry.failure_count,
+            enabled: entry.enabled,
                 }
             })
             .collect()

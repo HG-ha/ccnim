@@ -27,10 +27,13 @@ const DEFAULT_AUTH_TOKEN: &str = "freecc";
 /// hosts and self-hosted deployments). When `base_url` is empty, the proxy
 /// falls back to [`ProviderKind::default_base_url`].
 ///
+/// `enabled` controls whether this key is actively used for routing.
+/// Disabled keys are skipped during key selection but kept in the config.
+///
 /// Note: the type is named `NimApiKey` for source-level backwards
 /// compatibility with the original NIM-only build. New callers are
 /// encouraged to use the alias [`UpstreamKey`] instead.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct NimApiKey {
     pub id: String,
     pub value: String,
@@ -47,6 +50,18 @@ pub struct NimApiKey {
     /// don't surprise users by mutating their input.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_url: String,
+    /// Whether this key is enabled. Defaults to true for backwards compatibility.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Model mapping for this specific key. If None, falls back to global
+    /// AppConfig.model_mapping. This allows per-key customization when different
+    /// upstreams have different available models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_mapping: Option<ModelMappingConfig>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Modern alias for the structured upstream key. New code should prefer
@@ -63,6 +78,8 @@ impl NimApiKey {
             expires_at: None,
             provider: ProviderKind::default(),
             base_url: String::new(),
+            enabled: true,
+            model_mapping: None,
         }
     }
 
@@ -101,6 +118,7 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(PartialEq)]
 pub struct ModelMappingConfig {
     pub default_model: String,
     pub opus_model: Option<String>,

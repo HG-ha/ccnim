@@ -17,7 +17,7 @@ use nim_client::{
     AnthropicPassthroughClient, KeyPool, KeyPoolEntry, KeySnapshot, NimClient, NimClientError,
 };
 use proxy_core::{
-    anthropic_to_nim, count_input_tokens, MessagesRequest, ModelMapping, ModelsListResponse,
+    anthropic_to_nim, count_input_tokens, MessagesRequest, ModelsListResponse,
     NimRequestOptions, ProviderKind, SseBuilder, TokenCountRequest, TokenCountResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -103,8 +103,15 @@ pub fn key_pool_entries(keys: &[NimApiKey]) -> Vec<KeyPoolEntry> {
             expires_at: k.expires_at,
             provider: k.provider,
             base_url: k.effective_base_url(),
+            enabled: k.enabled,
         })
         .collect()
+}
+
+/// Get the model mapping for a specific key by its index.
+/// Returns None if the key doesn't have a custom model mapping configured.
+fn get_key_model_mapping(state: &ProxyState, key_id: usize) -> Option<app_config::ModelMappingConfig> {
+    state.config.nim_api_keys.get(key_id).and_then(|k| k.model_mapping.clone())
 }
 
 pub async fn start_server(config: AppConfig) -> anyhow::Result<RunningServer> {
@@ -266,9 +273,6 @@ async fn messages(
         return api_error(StatusCode::BAD_REQUEST, "messages cannot be empty");
     }
 
-    let mapping: ModelMapping = state.config.model_mapping.clone().into();
-    request.model = mapping.resolve(&request.model);
-
     // Pick a healthy lease across *all* configured providers, then split
     // on the lease's protocol family. This is what makes the dashboard
     // promise of "all keys round-robin together regardless of provider"
@@ -283,6 +287,12 @@ async fn messages(
             );
         }
     };
+
+    // Use the key's own model mapping if configured, otherwise fall back to global config
+    let mapping: proxy_core::ModelMapping = get_key_model_mapping(&state, lease.key_id())
+        .map(|m| m.into())
+        .unwrap_or_else(|| state.config.model_mapping.clone().into());
+    request.model = mapping.resolve(&request.model);
 
     match lease.provider() {
         ProviderKind::AnthropicCompat => anthropic_passthrough(state, lease, request).await,

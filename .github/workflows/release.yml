@@ -157,11 +157,67 @@ jobs:
             
             ### Windows
             下载 `CCNim_*_x64-setup.exe` 双击安装即可。
-            
-            ### macOS
-            下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac），
-            打开后将应用拖到 Applications 文件夹即可。未签名版本首次运行时
-            可能被 Gatekeeper 拦截，右键「打开」一次即可。
+                        
+            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
+
+            **首次运行提示"文件损坏"怎么办？**
+
+            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
+
+            1. 打开终端
+            2. 输入以下命令：
+              ```bash
+              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
+              ```
+            3. 输入密码后回车
+            4. 双击应用即可正常运行
+
+            或者：右键应用 → 打开 → 点击"打开"按钮。
+            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
+
+            **首次运行提示"文件损坏"怎么办？**
+
+            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
+
+            1. 打开终端
+            2. 输入以下命令：
+              ```bash
+              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
+              ```
+            3. 输入密码后回车
+            4. 双击应用即可正常运行
+
+            或者：右键应用 → 打开 → 点击"打开"按钮。
+            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
+
+            **首次运行提示"文件损坏"怎么办？**
+
+            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
+
+            1. 打开终端
+            2. 输入以下命令：
+              ```bash
+              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
+              ```
+            3. 输入密码后回车
+            4. 双击应用即可正常运行
+
+            或者：右键应用 → 打开 → 点击"打开"按钮。
+            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
+
+            **首次运行提示"文件损坏"怎么办？**
+
+            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
+
+            1. 打开终端
+            2. 输入以下命令：
+              ```bash
+              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
+              ```
+            3. 输入密码后回车
+            4. 双击应用即可正常运行
+
+            或者：右键应用 → 打开 → 点击"打开"按钮。
             
             ### Linux
             下载 `CCNim_*_amd64.AppImage`，`chmod +x` 后双击运行。
@@ -177,8 +233,6 @@ jobs:
           # 了，而其余两个平台 asset 还在上传」的中间状态。
           releaseDraft: true
           prerelease: false
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
 
   # 所有平台 build 完后，把 draft release 转为 published。

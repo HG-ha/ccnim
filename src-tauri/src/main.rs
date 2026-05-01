@@ -173,12 +173,22 @@ fn open_claude_terminal(cwd: String) -> Result<(), String> {
     open_terminal_with_claude(&cwd, &base_url, &config.auth_token)
 }
 #[tauri::command]
-fn open_claude_desktop() -> Result<(), String> {
+fn open_claude_desktop(state: State<'_, AppState>) -> Result<String, String> {
     let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
     let proxy_url = format!("http://{}:{}", config.host, config.port);
+    let auth_token = config.auth_token.clone();
 
-    // 配置 Claude Desktop 的代理设置
-    configure_claude_desktop_proxy(&proxy_url)?;
+    // 检查代理是否正在运行
+    let guard = state.server.lock().map_err(|_| "server lock poisoned")?;
+    let proxy_running = guard.is_some();
+    drop(guard);
+
+    if !proxy_running {
+        return Err("请先启动本地代理，再配置 Claude Desktop".to_string());
+    }
+
+    // 配置 Claude Desktop 的免登录设置
+    configure_claude_desktop_free(&proxy_url, &auth_token)?;
 
     // 然后打开应用
     #[cfg(target_os = "windows")]
@@ -208,16 +218,30 @@ fn open_claude_desktop() -> Result<(), String> {
             .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
     }
 
-    Ok(())
+    Ok(format!(
+        "配置文件已写入。\n\n后续步骤：\n1. 首次使用需要在 Claude Desktop 中启用开发者模式\n2. 打开 Claude Desktop → Help → Troubleshooting → Enable Developer Mode\n3. 重启 Claude Desktop\n4. 进入 Settings → Claude Code → Developer → Configure Third-party Inference\n5. 配置 Base URL 和 API Key，点击 Apply Locally",
+    ))
 }
 
-/// 配置 Claude Desktop 的代理设置
-fn configure_claude_desktop_proxy(proxy_url: &str) -> Result<(), String> {
+/// 配置 Claude Desktop 免登录模式
+///
+/// 原理：Claude Desktop 内部的 Claude Code 会读取 ~/.claude/settings.json
+    use std::io::Read;
+/// 中的 claudeCode.environmentVariables，通过注入 ANTHROPIC_BASE_URL
+/// 和 ANTHROPIC_AUTH_TOKEN 来绕过官方认证。
+fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<(), String> {
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     // 获取 Claude Desktop 配置目录
-    let config_dir = get_claude_config_dir()?;
+    #[cfg(target_os = "windows")]
+    let config_dir = PathBuf::from(std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA")?);
+    #[cfg(not(target_os = "windows"))]
+    let config_dir = {
+        let home = user_home().ok_or_else(|| "无法获取 HOME 目录")?;
+        home.join(".claude")
+    };
+
     let settings_path = config_dir.join("settings.json");
 
     // 确保目录存在
@@ -234,18 +258,68 @@ fn configure_claude_desktop_proxy(proxy_url: &str) -> Result<(), String> {
         serde_json::json!({})
     };
 
-    // 设置代理环境变量
+    // 注入环境变量，让 Claude Desktop 内部的 Claude Code 使用本地代理
+    // 这是免登录的核心：ANTHROPIC_BASE_URL 指向本地代理，ANTHROPIC_AUTH_TOKEN 使用配置的 token
+    if let Some(env) = config
+        .get_mut("claudeCode")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|o| o.get_mut("environmentVariables"))
+        .and_then(|v| v.as_array_mut())
+    {
+        // 更新或添加 ANTHROPIC_BASE_URL
+        if let Some(item) = env.iter_mut().find(|v| {
+            v.get("name").and_then(|n| n.as_str()) == Some("ANTHROPIC_BASE_URL")
+        }) {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("value".to_string(), serde_json::json!(proxy_url));
+            }
+        } else {
+            env.push(serde_json::json!({
+                "name": "ANTHROPIC_BASE_URL",
+                "value": proxy_url
+            }));
+        }
+
+        // 更新或添加 ANTHROPIC_AUTH_TOKEN
+        if let Some(item) = env.iter_mut().find(|v| {
+            v.get("name").and_then(|n| n.as_str()) == Some("ANTHROPIC_AUTH_TOKEN")
+        }) {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("value".to_string(), serde_json::json!(auth_token));
+            }
+        } else {
+            env.push(serde_json::json!({
+                "name": "ANTHROPIC_AUTH_TOKEN",
+                "value": auth_token
+            }));
+        }
+    } else {
+        // 创建新的 claudeCode 配置
+        if let Some(obj) = config.as_object_mut() {
+            obj.insert(
+                "claudeCode".to_string(),
+                serde_json::json!({
+                    "environmentVariables": [
+                        { "name": "ANTHROPIC_BASE_URL", "value": proxy_url },
+                        { "name": "ANTHROPIC_AUTH_TOKEN", "value": auth_token }
+                    ]
+                }),
+            );
+        }
+
+    // 同时注入 environment（Claude Desktop 应用本身使用）
     if let Some(env) = config
         .get_mut("environment")
         .and_then(|v| v.as_object_mut())
     {
-        env.insert("HTTP_PROXY".to_string(), serde_json::json!(proxy_url));
-        env.insert("HTTPS_PROXY".to_string(), serde_json::json!(proxy_url));
+        env.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(proxy_url));
+        env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), serde_json::json!(auth_token));
     } else {
         config["environment"] = serde_json::json!({
-        "HTTP_PROXY": proxy_url,
-        "HTTPS_PROXY": proxy_url
+            "ANTHROPIC_BASE_URL": proxy_url,
+            "ANTHROPIC_AUTH_TOKEN": auth_token
         });
+    }
     }
 
     // 写回配置文件
@@ -254,36 +328,35 @@ fn configure_claude_desktop_proxy(proxy_url: &str) -> Result<(), String> {
     file.write_all(contents.as_bytes())
         .map_err(|e| format!("写入失败：{e}"))?;
 
+    // 关键：创建 Claude-3p/claude_desktop_config.json 以启用第三方推理模式
+    // 这是让 Claude Desktop 跳过登录的关键
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = user_home().ok_or_else(|| "无法获取 HOME 目录")?;
+        let claude3p_dir = home.join(".claude").parent().unwrap().join("Claude-3p");
+        fs::create_dir_all(&claude3p_dir).map_err(|e| format!("无法创建目录：{e}"))?;
+
+        let claude3p_config_path = claude3p_dir.join("claude_desktop_config.json");
+        let claude3p_config = serde_json::json!({
+            "deploymentMode": "3p",
+            "preferences": {
+                "coworkWebSearchEnabled": true,
+                "coworkScheduledTasksEnabled": true,
+                "ccdScheduledTasksEnabled": false
+            }
+        });
+        let contents3p = serde_json::to_string_pretty(&claude3p_config).map_err(|e| format!("序列化失败：{e}"))?;
+        fs::write(&claude3p_config_path, contents3p).map_err(|e| format!("写入失败：{e}"))?;
+    }
+
     Ok(())
 }
 
-/// 获取 Claude Desktop 的配置目录
-fn get_claude_config_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let app_data = std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量")?;
-        Ok(PathBuf::from(app_data).join("Claude"))
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量")?;
-        Ok(PathBuf::from(home).join(".claude"))
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量")?;
-        Ok(PathBuf::from(home).join(".config").join("claude"))
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        Err("当前平台不支持 Claude Desktop".to_string())
-    }
-}
-
 fn user_home() -> Option<PathBuf> {
+
+
+
+
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("USERPROFILE").map(PathBuf::from)

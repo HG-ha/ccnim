@@ -2437,3 +2437,64 @@ textarea {
   flex: 1;
   min-width: 0;
 }
+
+/* Toggle switch for enabling/disabling keys */
+.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  margin-left: auto;
+}
+
+.toggle-switch input {
+  display: none;
+}
+
+.toggle-slider {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  background: var(--border-strong);
+  border-radius: 999px;
+  transition: all 120ms ease-out;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: white;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: all 120ms ease-out;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: var(--success);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  left: 18px;
+}
+
+.toggle-switch:hover .toggle-slider {
+  opacity: 0.9;
+}
+
+/* Dim the key card when disabled */
+.key-card.managed.state-neutral.expiry-unknown {
+  opacity: 0.6;
+}
+
+.key-card.managed.state-neutral.expiry-unknown .key-id,
+.key-card.managed.state-neutral.expiry-unknown .key-label,
+.key-card.managed.state-neutral.expiry-unknown .key-endpoint {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-dim);
+  text-decoration-thickness: 1px;
+}
