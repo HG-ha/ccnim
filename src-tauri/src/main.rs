@@ -218,9 +218,7 @@ fn open_claude_desktop(state: State<'_, AppState>) -> Result<String, String> {
             .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
     }
 
-    Ok(format!(
-        "配置文件已写入。\n\n后续步骤：\n1. 首次使用需要在 Claude Desktop 中启用开发者模式\n2. 打开 Claude Desktop → Help → Troubleshooting → Enable Developer Mode\n3. 重启 Claude Desktop\n4. 进入 Settings → Claude Code → Developer → Configure Third-party Inference\n5. 配置 Base URL 和 API Key，点击 Apply Locally",
-    ))
+    Ok("配置文件已写入。\n\n后续步骤：\n1. 首次使用需要在 Claude Desktop 中启用开发者模式\n2. 打开 Claude Desktop → Help → Troubleshooting → Enable Developer Mode\n3. 重启 Claude Desktop\n4. 进入 Settings → Claude Code → Developer → Configure Third-party Inference\n5. 配置 Base URL 和 API Key，点击 Apply Locally".to_string())
 }
 
 /// 配置 Claude Desktop 免登录模式
@@ -238,7 +236,7 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
     let config_dir = PathBuf::from(std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA")?);
     #[cfg(not(target_os = "windows"))]
     let config_dir = {
-        let home = user_home().ok_or_else(|| "无法获取 HOME 目录")?;
+        let home = user_home().ok_or("无法获取 HOME 目录")?;
         home.join(".claude")
     };
 
@@ -340,7 +338,7 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
     // 这是让 Claude Desktop 跳过登录的关键
     #[cfg(not(target_os = "windows"))]
     {
-        let home = user_home().ok_or_else(|| "无法获取 HOME 目录")?;
+        let home = user_home().ok_or("无法获取 HOME 目录")?;
         let claude3p_dir = home.join(".claude").parent().unwrap().join("Claude-3p");
         fs::create_dir_all(&claude3p_dir).map_err(|e| format!("无法创建目录：{e}"))?;
 
