@@ -191,8 +191,8 @@ impl KeyPool {
             .enumerate()
             .filter(|(_, entry)| {
                 predicate(entry)
-                && entry.enabled
-                && entry.state == KeyState::Healthy
+                    && entry.enabled
+                    && entry.state == KeyState::Healthy
                     && entry.recent_requests.len() < self.rate_limit
             })
             .min_by_key(|(_, entry)| (entry.inflight, entry.recent_requests.len()))
@@ -280,7 +280,7 @@ impl KeyPool {
                     inflight: entry.inflight,
                     recent_requests: entry.recent_requests.len(),
                     failure_count: entry.failure_count,
-            enabled: entry.enabled,
+                    enabled: entry.enabled,
                 }
             })
             .collect()

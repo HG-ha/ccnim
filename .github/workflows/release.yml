@@ -154,7 +154,7 @@ jobs:
           releaseName: "CCNim ${{ github.ref_name }}"
           releaseBody: |
             ## 下载说明
-            
+
             ### Windows
             下载 `CCNim_*_x64-setup.exe` 双击安装即可。
                         
@@ -218,12 +218,12 @@ jobs:
             4. 双击应用即可正常运行
 
             或者：右键应用 → 打开 → 点击"打开"按钮。
-            
+
             ### Linux
             下载 `CCNim_*_amd64.AppImage`，`chmod +x` 后双击运行。
             （AppImage 是自带运行时的便携格式，无需安装、不依赖系统包管理器，
              也是 `tauri-plugin-updater` 在 Linux 唯一支持的自动更新格式。）
-            
+
             已安装旧版本的用户：下次启动应用时会自动检测到此版本，或者
             点仪表盘右上角的「检查更新」按钮立即升级。
           # 三个 matrix job 并行跑，最早跑完那个会以 draft 状态创建

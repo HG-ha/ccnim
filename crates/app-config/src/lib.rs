@@ -117,8 +117,7 @@ pub struct AppConfig {
     pub enable_thinking: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[derive(PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ModelMappingConfig {
     pub default_model: String,
     pub opus_model: Option<String>,

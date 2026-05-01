@@ -17,8 +17,8 @@ use nim_client::{
     AnthropicPassthroughClient, KeyPool, KeyPoolEntry, KeySnapshot, NimClient, NimClientError,
 };
 use proxy_core::{
-    anthropic_to_nim, count_input_tokens, MessagesRequest, ModelsListResponse,
-    NimRequestOptions, ProviderKind, SseBuilder, TokenCountRequest, TokenCountResponse,
+    anthropic_to_nim, count_input_tokens, MessagesRequest, ModelsListResponse, NimRequestOptions,
+    ProviderKind, SseBuilder, TokenCountRequest, TokenCountResponse,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -110,8 +110,15 @@ pub fn key_pool_entries(keys: &[NimApiKey]) -> Vec<KeyPoolEntry> {
 
 /// Get the model mapping for a specific key by its index.
 /// Returns None if the key doesn't have a custom model mapping configured.
-fn get_key_model_mapping(state: &ProxyState, key_id: usize) -> Option<app_config::ModelMappingConfig> {
-    state.config.nim_api_keys.get(key_id).and_then(|k| k.model_mapping.clone())
+fn get_key_model_mapping(
+    state: &ProxyState,
+    key_id: usize,
+) -> Option<app_config::ModelMappingConfig> {
+    state
+        .config
+        .nim_api_keys
+        .get(key_id)
+        .and_then(|k| k.model_mapping.clone())
 }
 
 pub async fn start_server(config: AppConfig) -> anyhow::Result<RunningServer> {

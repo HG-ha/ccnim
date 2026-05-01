@@ -226,7 +226,7 @@ fn open_claude_desktop(state: State<'_, AppState>) -> Result<String, String> {
 /// 配置 Claude Desktop 免登录模式
 ///
 /// 原理：Claude Desktop 内部的 Claude Code 会读取 ~/.claude/settings.json
-    use std::io::Read;
+use std::io::Read;
 /// 中的 claudeCode.environmentVariables，通过注入 ANTHROPIC_BASE_URL
 /// 和 ANTHROPIC_AUTH_TOKEN 来绕过官方认证。
 fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<(), String> {
@@ -267,9 +267,10 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
         .and_then(|v| v.as_array_mut())
     {
         // 更新或添加 ANTHROPIC_BASE_URL
-        if let Some(item) = env.iter_mut().find(|v| {
-            v.get("name").and_then(|n| n.as_str()) == Some("ANTHROPIC_BASE_URL")
-        }) {
+        if let Some(item) = env
+            .iter_mut()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("ANTHROPIC_BASE_URL"))
+        {
             if let Some(obj) = item.as_object_mut() {
                 obj.insert("value".to_string(), serde_json::json!(proxy_url));
             }
@@ -281,9 +282,10 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
         }
 
         // 更新或添加 ANTHROPIC_AUTH_TOKEN
-        if let Some(item) = env.iter_mut().find(|v| {
-            v.get("name").and_then(|n| n.as_str()) == Some("ANTHROPIC_AUTH_TOKEN")
-        }) {
+        if let Some(item) = env
+            .iter_mut()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("ANTHROPIC_AUTH_TOKEN"))
+        {
             if let Some(obj) = item.as_object_mut() {
                 obj.insert("value".to_string(), serde_json::json!(auth_token));
             }
@@ -307,19 +309,25 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
             );
         }
 
-    // 同时注入 environment（Claude Desktop 应用本身使用）
-    if let Some(env) = config
-        .get_mut("environment")
-        .and_then(|v| v.as_object_mut())
-    {
-        env.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(proxy_url));
-        env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), serde_json::json!(auth_token));
-    } else {
-        config["environment"] = serde_json::json!({
-            "ANTHROPIC_BASE_URL": proxy_url,
-            "ANTHROPIC_AUTH_TOKEN": auth_token
-        });
-    }
+        // 同时注入 environment（Claude Desktop 应用本身使用）
+        if let Some(env) = config
+            .get_mut("environment")
+            .and_then(|v| v.as_object_mut())
+        {
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                serde_json::json!(proxy_url),
+            );
+            env.insert(
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                serde_json::json!(auth_token),
+            );
+        } else {
+            config["environment"] = serde_json::json!({
+                "ANTHROPIC_BASE_URL": proxy_url,
+                "ANTHROPIC_AUTH_TOKEN": auth_token
+            });
+        }
     }
 
     // 写回配置文件
@@ -345,7 +353,8 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
                 "ccdScheduledTasksEnabled": false
             }
         });
-        let contents3p = serde_json::to_string_pretty(&claude3p_config).map_err(|e| format!("序列化失败：{e}"))?;
+        let contents3p = serde_json::to_string_pretty(&claude3p_config)
+            .map_err(|e| format!("序列化失败：{e}"))?;
         fs::write(&claude3p_config_path, contents3p).map_err(|e| format!("写入失败：{e}"))?;
     }
 
@@ -353,10 +362,6 @@ fn configure_claude_desktop_free(proxy_url: &str, auth_token: &str) -> Result<()
 }
 
 fn user_home() -> Option<PathBuf> {
-
-
-
-
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("USERPROFILE").map(PathBuf::from)
