@@ -22,7 +22,7 @@ pub enum KeyState {
 /// re-reading the secrets file on every snapshot, and enough information
 /// for [`KeyLease`] consumers to know which upstream protocol/URL to talk
 /// to.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KeyPoolEntry {
     pub value: String,
     pub label: Option<String>,
@@ -37,6 +37,19 @@ pub struct KeyPoolEntry {
     pub base_url: String,
     /// Whether this key is enabled.
     pub enabled: bool,
+}
+
+impl Default for KeyPoolEntry {
+    fn default() -> Self {
+        Self {
+            value: String::new(),
+            label: None,
+            expires_at: None,
+            provider: ProviderKind::Nim,
+            base_url: String::new(),
+            enabled: true,
+        }
+    }
 }
 
 impl KeyPoolEntry {
