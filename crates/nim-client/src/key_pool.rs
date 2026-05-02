@@ -24,6 +24,12 @@ pub enum KeyState {
 /// to.
 #[derive(Debug, Clone)]
 pub struct KeyPoolEntry {
+    /// Stable identifier for this key — typically the UUID stored on
+    /// `NimApiKey.id`. Used to attach long-lived statistics (token
+    /// usage, latency, success/failure totals) to the *same* logical
+    /// key even if the user rotates its secret value, and used by
+    /// [`KeyPool::update_keys`] to merge live counters across edits.
+    pub stable_id: String,
     pub value: String,
     pub label: Option<String>,
     /// Unix epoch seconds. `None` means "never expires".
@@ -37,25 +43,34 @@ pub struct KeyPoolEntry {
     pub base_url: String,
     /// Whether this key is enabled.
     pub enabled: bool,
+    /// Per-key rate limit in requests per pool-wide window.
+    /// `None` disables the local cap entirely — useful for upstreams
+    /// (OpenAI / Anthropic compat hosts) whose quotas vary widely
+    /// and are best left to the upstream itself.
+    pub rate_limit: Option<usize>,
 }
 
 impl Default for KeyPoolEntry {
     fn default() -> Self {
         Self {
+            stable_id: String::new(),
             value: String::new(),
             label: None,
             expires_at: None,
             provider: ProviderKind::Nim,
             base_url: String::new(),
             enabled: true,
+            rate_limit: None,
         }
     }
 }
 
 impl KeyPoolEntry {
     pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
         Self {
-            value: value.into(),
+            stable_id: value.clone(),
+            value,
             ..Default::default()
         }
     }
@@ -64,6 +79,11 @@ impl KeyPoolEntry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KeySnapshot {
     pub id: usize,
+    /// Stable, config-level identifier (matches `NimApiKey.id`). The
+    /// frontend joins this against per-key metrics so usage history
+    /// follows the key across edits / pool rebuilds.
+    #[serde(default)]
+    pub stable_id: String,
     pub masked: String,
     pub label: Option<String>,
     pub expires_at: Option<i64>,
@@ -81,11 +101,17 @@ pub struct KeySnapshot {
     pub failure_count: usize,
     /// Whether this key is enabled.
     pub enabled: bool,
+    /// Effective rate limit (requests per the pool-wide window) for
+    /// this key. `None` means the local cap is disabled — the pool
+    /// will not refuse to lease this key based on `recent_requests`.
+    #[serde(default)]
+    pub rate_limit: Option<usize>,
 }
 
 #[derive(Debug)]
 struct KeyEntry {
     id: usize,
+    stable_id: String,
     value: String,
     label: Option<String>,
     expires_at: Option<i64>,
@@ -97,12 +123,14 @@ struct KeyEntry {
     cooldown_until: Option<Instant>,
     failure_count: usize,
     enabled: bool,
+    rate_limit: Option<usize>,
 }
 
 impl KeyEntry {
     fn fresh(id: usize, entry: KeyPoolEntry) -> Self {
         Self {
             id,
+            stable_id: entry.stable_id,
             value: entry.value,
             label: entry.label,
             expires_at: entry.expires_at,
@@ -114,6 +142,7 @@ impl KeyEntry {
             cooldown_until: None,
             failure_count: 0,
             enabled: entry.enabled,
+            rate_limit: entry.rate_limit,
         }
     }
 
@@ -124,6 +153,7 @@ impl KeyEntry {
     fn merged(id: usize, entry: KeyPoolEntry, prev: &KeyEntry) -> Self {
         Self {
             id,
+            stable_id: entry.stable_id,
             value: entry.value,
             label: entry.label,
             expires_at: entry.expires_at,
@@ -135,6 +165,7 @@ impl KeyEntry {
             cooldown_until: prev.cooldown_until,
             failure_count: prev.failure_count,
             enabled: entry.enabled,
+            rate_limit: entry.rate_limit,
         }
     }
 }
@@ -142,7 +173,10 @@ impl KeyEntry {
 #[derive(Debug, Clone)]
 pub struct KeyPool {
     inner: Arc<Mutex<Vec<KeyEntry>>>,
-    rate_limit: usize,
+    /// Sliding window over which each entry's rate-limit counter is
+    /// pruned. The actual cap is per-entry (see [`KeyEntry::rate_limit`])
+    /// — keeping the window pool-wide just avoids a redundant copy on
+    /// every key.
     rate_window: Duration,
 }
 
@@ -150,17 +184,21 @@ pub struct KeyPool {
 pub struct KeyLease {
     pool: KeyPool,
     key_id: usize,
+    stable_id: String,
     key: String,
     provider: ProviderKind,
     base_url: String,
 }
 
 impl KeyPool {
-    pub fn new(keys: Vec<KeyPoolEntry>, rate_limit: usize, rate_window: Duration) -> Self {
+    /// Build a new key pool. Each [`KeyPoolEntry`] carries its own
+    /// rate-limit cap (`None` means "unlimited") — the only pool-wide
+    /// knob left here is the window length used to slide the
+    /// rate-limit counters.
+    pub fn new(keys: Vec<KeyPoolEntry>, rate_window: Duration) -> Self {
         let entries = build_entries(keys, &[]);
         Self {
             inner: Arc::new(Mutex::new(entries)),
-            rate_limit,
             rate_window,
         }
     }
@@ -206,7 +244,10 @@ impl KeyPool {
                 predicate(entry)
                     && entry.enabled
                     && entry.state == KeyState::Healthy
-                    && entry.recent_requests.len() < self.rate_limit
+                    && entry
+                        .rate_limit
+                        .map(|limit| entry.recent_requests.len() < limit)
+                        .unwrap_or(true)
             })
             .min_by_key(|(_, entry)| (entry.inflight, entry.recent_requests.len()))
             .map(|(idx, _)| idx)?;
@@ -217,6 +258,7 @@ impl KeyPool {
         Some(KeyLease {
             pool: self.clone(),
             key_id: entry.id,
+            stable_id: entry.stable_id.clone(),
             key: entry.value.clone(),
             provider: entry.provider,
             base_url: entry.base_url.clone(),
@@ -284,6 +326,7 @@ impl KeyPool {
                 prune_requests(entry, now, self.rate_window);
                 KeySnapshot {
                     id: entry.id,
+                    stable_id: entry.stable_id.clone(),
                     masked: mask_key(&entry.value),
                     label: entry.label.clone(),
                     expires_at: entry.expires_at,
@@ -294,6 +337,7 @@ impl KeyPool {
                     recent_requests: entry.recent_requests.len(),
                     failure_count: entry.failure_count,
                     enabled: entry.enabled,
+                    rate_limit: entry.rate_limit,
                 }
             })
             .collect()
@@ -307,6 +351,14 @@ impl KeyLease {
 
     pub fn key_id(&self) -> usize {
         self.key_id
+    }
+
+    /// Stable, config-level identifier for this key (matches
+    /// `NimApiKey.id`). Use this — not [`KeyLease::key_id`] — when
+    /// recording metrics so the totals survive pool rebuilds and key
+    /// reorderings.
+    pub fn stable_id(&self) -> &str {
+        &self.stable_id
     }
 
     pub fn pool(&self) -> &KeyPool {
@@ -332,14 +384,29 @@ impl Drop for KeyLease {
 }
 
 fn build_entries(input: Vec<KeyPoolEntry>, prev: &[KeyEntry]) -> Vec<KeyEntry> {
+    // Match by `stable_id` first so editing the secret value of an
+    // existing key still preserves live counters; fall back to a
+    // value-based lookup for any legacy entries (or callers that
+    // intentionally reuse the secret as the stable id).
+    let by_stable: HashMap<&str, &KeyEntry> = prev
+        .iter()
+        .filter(|e| !e.stable_id.is_empty())
+        .map(|e| (e.stable_id.as_str(), e))
+        .collect();
     let by_value: HashMap<&str, &KeyEntry> = prev.iter().map(|e| (e.value.as_str(), e)).collect();
     input
         .into_iter()
         .filter(|entry| !entry.value.trim().is_empty())
         .enumerate()
-        .map(|(id, entry)| match by_value.get(entry.value.as_str()) {
-            Some(prev) => KeyEntry::merged(id, entry, prev),
-            None => KeyEntry::fresh(id, entry),
+        .map(|(id, entry)| {
+            let prev = by_stable
+                .get(entry.stable_id.as_str())
+                .copied()
+                .or_else(|| by_value.get(entry.value.as_str()).copied());
+            match prev {
+                Some(prev) => KeyEntry::merged(id, entry, prev),
+                None => KeyEntry::fresh(id, entry),
+            }
         })
         .collect()
 }
@@ -400,8 +467,13 @@ mod tests {
 
     fn pool(values: &[&str]) -> KeyPool {
         KeyPool::new(
-            values.iter().map(|v| KeyPoolEntry::new(*v)).collect(),
-            40,
+            values
+                .iter()
+                .map(|v| KeyPoolEntry {
+                    rate_limit: Some(40),
+                    ..KeyPoolEntry::new(*v)
+                })
+                .collect(),
             Duration::from_secs(60),
         )
     }
@@ -468,16 +540,17 @@ mod tests {
                     value: "nvapi-old".to_string(),
                     label: Some("expired".into()),
                     expires_at: Some(past),
+                    rate_limit: Some(40),
                     ..Default::default()
                 },
                 KeyPoolEntry {
                     value: "nvapi-new".to_string(),
                     label: None,
                     expires_at: Some(future),
+                    rate_limit: Some(40),
                     ..Default::default()
                 },
             ],
-            40,
             Duration::from_secs(60),
         );
 
@@ -533,6 +606,7 @@ mod tests {
                     value: "nvapi-x".into(),
                     provider: ProviderKind::Nim,
                     base_url: "https://integrate.api.nvidia.com/v1".into(),
+                    rate_limit: Some(40),
                     ..Default::default()
                 },
                 KeyPoolEntry {
@@ -548,7 +622,6 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            40,
             Duration::from_secs(60),
         );
 
@@ -575,13 +648,39 @@ mod tests {
                 value: "nvapi-x".into(),
                 provider: ProviderKind::Nim,
                 base_url: "https://integrate.api.nvidia.com/v1".into(),
+                rate_limit: Some(40),
                 ..Default::default()
             }],
-            40,
             Duration::from_secs(60),
         );
         assert!(pool.acquire_for(ProviderKind::AnthropicCompat).is_none());
         assert!(pool.acquire_for(ProviderKind::OpenaiCompat).is_none());
         assert!(pool.acquire_for(ProviderKind::Nim).is_some());
+    }
+
+    /// A `None` per-key rate limit means the pool refuses to gate
+    /// requests at all — useful for OpenAI/Anthropic-compat hosts
+    /// whose quotas vary widely and are best left to the upstream.
+    #[test]
+    fn unlimited_key_is_not_capped_by_recent_requests() {
+        let pool = KeyPool::new(
+            vec![KeyPoolEntry {
+                value: "sk-unlimited".into(),
+                provider: ProviderKind::OpenaiCompat,
+                base_url: "https://api.deepseek.com".into(),
+                rate_limit: None,
+                ..Default::default()
+            }],
+            Duration::from_secs(60),
+        );
+        // Burn a comfortable margin past any reasonable per-key cap;
+        // an unlimited key must keep handing out leases regardless.
+        for _ in 0..200 {
+            let lease = pool
+                .acquire()
+                .expect("unlimited key should always be acquirable");
+            drop(lease);
+        }
+        assert!(pool.snapshots()[0].rate_limit.is_none());
     }
 }

@@ -83,7 +83,6 @@ textarea,
 button,
 .btn-icon,
 .nav-item,
-.quick-btn,
 .sidebar-toggle,
 .tb-btn,
 a {
@@ -721,70 +720,167 @@ button:active {
   display: block;
 }
 
-/* ============== Quick actions ============== */
+/* ============== Dashboard tables ============== */
 
-.quick-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 10px;
+.metric-sup {
+  font-size: 14px;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-left: 2px;
 }
 
-.quick-btn {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  padding: 14px 16px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+.dash-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.dash-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12.5px;
+}
+
+.dash-table thead th {
   text-align: left;
-  position: relative;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
-.quick-btn:hover:not(:disabled) {
-  border-color: var(--accent);
+.dash-table thead th.num {
+  text-align: right;
+}
+
+.dash-table tbody td {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+  color: var(--text);
+}
+
+.dash-table tbody td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.dash-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.dash-table tbody tr:hover td {
   background: var(--accent-soft);
 }
 
-.quick-btn:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
+.dash-row.state-disabled,
+.dash-row.state-expired {
+  opacity: 0.7;
 }
 
-/* Neutralize the hover treatment on disabled tiles — but only for the
-   non-primary variant. The primary variant carries `color: #fff`; if we
-   also reset its background to `--surface-2` here we'd produce
-   white-on-white text the moment the cursor enters the button. */
-.quick-btn:not(.primary):disabled:hover {
-  background: var(--surface-2);
-  border-color: var(--border);
+.dash-row.state-disabled td:first-child,
+.dash-row.state-expired td:first-child {
+  border-left: 3px solid var(--danger, #ef4444);
 }
 
-.quick-btn.primary:disabled:hover {
-  background: linear-gradient(135deg, var(--accent) 0%, #06b6d4 100%);
-  border-color: transparent;
+.dash-row.state-cooling_down td:first-child,
+.dash-row.state-rate_limited td:first-child {
+  border-left: 3px solid #f59e0b;
 }
 
-.quick-btn.primary {
-  background: linear-gradient(135deg, var(--accent) 0%, #06b6d4 100%);
-  color: #fff;
-  border-color: transparent;
-  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.22);
+.dash-row.state-healthy td:first-child {
+  border-left: 3px solid var(--success, #10b981);
 }
 
-.quick-btn.primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, var(--accent-hover) 0%, #0891b2 100%);
+.dash-cell-key {
+  min-width: 220px;
+  max-width: 320px;
 }
 
-.quick-btn strong {
+.dash-key-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.dash-key-label {
+  font-weight: 600;
   font-size: 13px;
-  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.quick-btn span {
+.dash-key-mask {
   font-size: 11.5px;
-  opacity: 0.85;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dash-cell-strong {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.dash-cell-strong.fail {
+  color: var(--danger, #ef4444);
+}
+
+.dash-cell-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.dash-usage {
+  min-width: 130px;
+}
+
+.dash-usage-num {
+  font-weight: 600;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+
+.dash-usage-denom {
+  font-weight: 500;
+  color: var(--text-dim);
+  margin-left: 2px;
+}
+
+.usage-bar-track.tight {
+  height: 4px;
+  margin-bottom: 4px;
+}
+
+.dash-rank {
+  width: 40px;
+  text-align: center;
+  color: var(--text-dim);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dash-model {
+  font-size: 12.5px;
+  word-break: break-all;
+  max-width: 360px;
 }
 
 /* ============== Forms ============== */
@@ -1307,26 +1403,78 @@ textarea {
   grid-column: 1 / -1;
 }
 
-/* Edit-in-place card */
-.key-card.managed.editing {
-  border-color: var(--accent);
-  background: linear-gradient(180deg, var(--accent-soft) 0%, var(--surface) 50%);
-  box-shadow: 0 0 0 3px var(--accent-soft-2);
+/* Edit-key modal */
+.modal.modal-wide {
+  width: min(640px, 94vw);
+  max-height: min(86vh, 760px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
 }
 
-.key-card.managed.editing .field {
+.edit-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--accent-soft) 0%, var(--surface) 100%);
+}
+
+.edit-modal-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-modal-head h3 .key-num {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft-2);
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.edit-modal-body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.edit-modal-body .field {
   margin: 0;
 }
 
-.key-card.managed.editing .form-grid.two {
+.edit-modal-body .form-grid.two {
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
 
 @media (max-width: 720px) {
-  .key-card.managed.editing .form-grid.two {
+  .edit-modal-body .form-grid.two {
     grid-template-columns: 1fr;
   }
+}
+
+.edit-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
 }
 
 /* ============== Add / batch import forms ============== */
@@ -1501,22 +1649,6 @@ textarea {
   line-height: 1.55;
   white-space: pre;
   overflow-x: auto;
-}
-
-.diag-pre {
-  margin: 0;
-  padding: 12px 14px;
-  background: #0f172a;
-  color: #e2e8f0;
-  border-radius: 10px;
-  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
-  font-size: 12px;
-  line-height: 1.55;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 320px;
-  overflow-y: auto;
 }
 
 .steps code,
@@ -1915,7 +2047,6 @@ textarea {
 @media (max-width: 720px) {
   .form-grid.three,
   .form-grid.two,
-  .quick-grid,
   .ide-grid,
   .info-grid,
   .ide-auto-grid {
@@ -2114,11 +2245,6 @@ textarea {
     color: #f87171;
   }
 
-  .quick-btn.primary,
-  .quick-btn.primary:disabled:hover {
-    box-shadow: 0 4px 14px rgba(90, 146, 255, 0.28);
-  }
-
   .toast {
     background: #232a39;
     color: #e6ebf5;
@@ -2139,11 +2265,6 @@ textarea {
   input:focus,
   textarea:focus {
     box-shadow: 0 0 0 3px rgba(90, 146, 255, 0.22);
-  }
-
-  .diag-pre {
-    background: #060a13;
-    color: #cdd5e2;
   }
 
   .modal-backdrop {
@@ -2497,4 +2618,181 @@ textarea {
   text-decoration: line-through;
   text-decoration-color: var(--text-dim);
   text-decoration-thickness: 1px;
+}
+
+/* Claude Desktop 配置步骤样式 */
+.desktop-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.step {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.step-num {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.step-content {
+  flex: 1;
+}
+
+.step-content strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+
+.step-content p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.step-content code {
+  background: var(--surface-2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--primary);
+}
+
+.desktop-warning {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--warn-bg);
+  border-left: 3px solid var(--warn);
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--warn-text);
+}
+
+/* 模型选择下拉 */
+.model-select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.model-select:hover {
+  border-color: var(--primary);
+}
+
+.model-select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-10);
+}
+
+.btn-sm {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+/* Per-key model mapping autocomplete (edit card). The wrapper is
+   `position: relative` so the dropdown can absolutely-position itself
+   immediately below the input regardless of the surrounding grid. */
+.model-combobox {
+  position: relative;
+}
+
+.model-combobox-input {
+  width: 100%;
+}
+
+.model-combobox-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  /* Width grows with the longest item rather than being clamped to the
+     input. Without this, names like "deepseek-ai/deepseek-v3.1-terminus"
+     hit `text-overflow: ellipsis` and the user can't tell variants apart.
+     `min-width: 100%` keeps the dropdown at least as wide as the input,
+     `max-width` prevents it from overflowing the viewport on narrow
+     windows. */
+  min-width: 100%;
+  width: max-content;
+  max-width: min(560px, calc(100vw - 80px));
+  z-index: 50;
+  max-height: 240px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+  padding: 4px;
+}
+
+.model-combobox-dropdown[hidden] {
+  display: none;
+}
+
+.model-combobox-item {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.model-combobox-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.edit-mapping {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.edit-mapping-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.edit-mapping-head > span {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.edit-mapping-hint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
 }

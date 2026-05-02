@@ -1,7 +1,9 @@
+mod metrics;
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app_config::{AppConfig, NimApiKey};
 use async_stream::stream;
@@ -26,12 +28,16 @@ use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
+pub use metrics::{KeyMetrics, MetricsSnapshot, ModelMetrics};
+use metrics::{MetricsRegistry, UsageSniffer};
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<AppConfig>,
     pub nim: NimClient,
     pub anthropic: AnthropicPassthroughClient,
     pub key_pool: KeyPool,
+    pub metrics: MetricsRegistry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +46,11 @@ pub struct ProxyStatus {
     pub listen_url: String,
     pub default_model: String,
     pub keys: Vec<KeySnapshot>,
+    /// Live request statistics. `Some` only when the proxy is running;
+    /// `None` when stopped (the in-memory registry was destroyed with
+    /// the previous `RunningServer`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsSnapshot>,
 }
 
 pub struct RunningServer {
@@ -47,6 +58,7 @@ pub struct RunningServer {
     task: tokio::task::JoinHandle<()>,
     addr: SocketAddr,
     key_pool: KeyPool,
+    metrics: MetricsRegistry,
 }
 
 /// Hard cap on how long we wait for axum's graceful shutdown to drain
@@ -64,6 +76,12 @@ impl RunningServer {
 
     pub fn key_pool(&self) -> &KeyPool {
         &self.key_pool
+    }
+
+    /// Snapshot live request metrics for the dashboard. Counters are
+    /// kept in-memory and reset whenever this server is dropped.
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Trigger axum's graceful shutdown and wait for the serve task to
@@ -95,46 +113,74 @@ impl RunningServer {
 /// don't each repeat the field-by-field copy. The base URL is resolved
 /// to a normalised, trailing-slash-free form so the upstream clients can
 /// concatenate paths without bookkeeping.
-pub fn key_pool_entries(keys: &[NimApiKey]) -> Vec<KeyPoolEntry> {
+/// Convert the structured per-key configuration carried in
+/// [`AppConfig`] into the runtime-only [`KeyPoolEntry`] shape understood
+/// by [`KeyPool`].
+///
+/// `default_nim_limit` is the global "every NIM key gets this many
+/// requests per window" knob. It is *only* applied to keys whose
+/// provider is [`ProviderKind::Nim`] and which haven't set their own
+/// override; OpenAI- / Anthropic-compatible keys default to no local
+/// rate limit because their quotas don't share NIM's neat 40 RPM cap.
+pub fn key_pool_entries(keys: &[NimApiKey], default_nim_limit: usize) -> Vec<KeyPoolEntry> {
     keys.iter()
         .map(|k| KeyPoolEntry {
+            stable_id: k.id.clone(),
             value: k.value.clone(),
             label: k.label.clone(),
             expires_at: k.expires_at,
             provider: k.provider,
             base_url: k.effective_base_url(),
             enabled: k.enabled,
+            rate_limit: k.effective_rate_limit(default_nim_limit),
         })
         .collect()
 }
 
-/// Get the model mapping for a specific key by its index.
-/// Returns None if the key doesn't have a custom model mapping configured.
-fn get_key_model_mapping(
-    state: &ProxyState,
-    key_id: usize,
-) -> Option<app_config::ModelMappingConfig> {
-    state
+/// Resolve the effective model mapping for a leased key. The per-key
+/// override merges *field by field* with the global mapping: any field
+/// the user left blank on the key card inherits its value from the
+/// dashboard-level mapping, so partial overrides ("only sonnet differs
+/// for this upstream") work without forcing the user to copy the rest.
+fn effective_mapping_for_key(state: &ProxyState, key_id: usize) -> proxy_core::ModelMapping {
+    let global = &state.config.model_mapping;
+    let pk = state
         .config
         .nim_api_keys
         .get(key_id)
-        .and_then(|k| k.model_mapping.clone())
+        .and_then(|k| k.model_mapping.as_ref());
+    let trimmed = |s: Option<&String>| {
+        s.map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    proxy_core::ModelMapping {
+        default_model: trimmed(pk.and_then(|p| p.default_model.as_ref()))
+            .unwrap_or_else(|| global.default_model.clone()),
+        opus_model: trimmed(pk.and_then(|p| p.opus_model.as_ref()))
+            .or_else(|| global.opus_model.clone()),
+        sonnet_model: trimmed(pk.and_then(|p| p.sonnet_model.as_ref()))
+            .or_else(|| global.sonnet_model.clone()),
+        haiku_model: trimmed(pk.and_then(|p| p.haiku_model.as_ref()))
+            .or_else(|| global.haiku_model.clone()),
+    }
 }
 
 pub async fn start_server(config: AppConfig) -> anyhow::Result<RunningServer> {
     let addr: SocketAddr = config.listen_addr().parse()?;
     let key_pool = KeyPool::new(
-        key_pool_entries(&config.nim_api_keys),
-        config.rate_limit_per_key,
+        key_pool_entries(&config.nim_api_keys, config.rate_limit_per_key),
         Duration::from_secs(config.rate_window_secs),
     );
     let nim = NimClient::new(key_pool.clone())?;
     let anthropic = AnthropicPassthroughClient::new()?;
+    let metrics = MetricsRegistry::new();
     let state = ProxyState {
         config: Arc::new(config),
         nim,
         anthropic,
         key_pool: key_pool.clone(),
+        metrics: metrics.clone(),
     };
     let app = router(state);
     let listener = TcpListener::bind(addr).await?;
@@ -154,6 +200,7 @@ pub async fn start_server(config: AppConfig) -> anyhow::Result<RunningServer> {
         task,
         addr,
         key_pool,
+        metrics,
     })
 }
 
@@ -197,6 +244,7 @@ async fn status(State(state): State<ProxyState>) -> impl IntoResponse {
         listen_url: format!("http://{}:{}", state.config.host, state.config.port),
         default_model: state.config.model_mapping.default_model.clone(),
         keys: state.key_pool.snapshots(),
+        metrics: Some(state.metrics.snapshot()),
     })
 }
 
@@ -295,10 +343,7 @@ async fn messages(
         }
     };
 
-    // Use the key's own model mapping if configured, otherwise fall back to global config
-    let mapping: proxy_core::ModelMapping = get_key_model_mapping(&state, lease.key_id())
-        .map(|m| m.into())
-        .unwrap_or_else(|| state.config.model_mapping.clone().into());
+    let mapping = effective_mapping_for_key(&state, lease.key_id());
     request.model = mapping.resolve(&request.model);
 
     match lease.provider() {
@@ -328,11 +373,61 @@ async fn openai_compat_messages(
             ..NimRequestOptions::default()
         },
     );
-    let stream = match state.nim.stream_chat_with_lease(lease, body).await {
+
+    let key_id = lease.stable_id().to_string();
+    let model = request.model.clone();
+    let started = Instant::now();
+
+    let raw = match state.nim.stream_chat_with_lease(lease, body).await {
         Ok(stream) => stream,
-        Err(err) => return upstream_error_response(err),
+        Err(err) => {
+            state
+                .metrics
+                .record_failure(&key_id, &model, started.elapsed());
+            return upstream_error_response(err);
+        }
     };
-    let sse = stream_anthropic_sse(request.model, input_tokens, stream);
+
+    // Tap each chunk to capture the latest `usage` payload before
+    // forwarding it downstream. We record the success exactly once, when
+    // the upstream stream terminates, so partial reads still report the
+    // most accurate input/output counts the upstream gave us.
+    let metrics = state.metrics.clone();
+    let key_id_for_stream = key_id.clone();
+    let model_for_stream = model.clone();
+    let estimated_input = input_tokens as u64;
+    let tapped = stream! {
+        let mut last_usage: Option<proxy_core::Usage> = None;
+        let mut had_error = false;
+        futures_util::pin_mut!(raw);
+        while let Some(item) = raw.next().await {
+            match &item {
+                Ok(chunk) => {
+                    if let Some(u) = chunk.usage {
+                        last_usage = Some(u);
+                    }
+                }
+                Err(_) => had_error = true,
+            }
+            yield item;
+        }
+        let elapsed = started.elapsed();
+        let (input, output) = match last_usage {
+            Some(u) => (
+                u.prompt_tokens.map(|n| n as u64).unwrap_or(estimated_input),
+                u.completion_tokens.map(|n| n as u64).unwrap_or(0),
+            ),
+            None => (estimated_input, 0),
+        };
+        if had_error {
+            metrics.record_failure(&key_id_for_stream, &model_for_stream, elapsed);
+        } else {
+            metrics.record_success(&key_id_for_stream, &model_for_stream, input, output, elapsed);
+        }
+    };
+    let tapped: nim_client::NimChunkStream = Box::pin(tapped);
+
+    let sse = stream_anthropic_sse(request.model, input_tokens, tapped);
     Sse::new(sse)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
@@ -349,6 +444,12 @@ async fn anthropic_passthrough(
     lease: nim_client::KeyLease,
     request: MessagesRequest,
 ) -> Response {
+    let estimated_input = count_input_tokens(
+        &request.messages,
+        request.system.as_ref(),
+        request.tools.as_deref(),
+    ) as u64;
+
     // Force `stream: true` so the upstream sends SSE; the rest of the
     // local proxy assumes streaming responses end-to-end. Most clients
     // already set this, but Claude Code occasionally omits it.
@@ -366,13 +467,22 @@ async fn anthropic_passthrough(
         }
     };
 
+    let key_id = lease.stable_id().to_string();
+    let model = request.model.clone();
+    let started = Instant::now();
+
     let upstream = match state
         .anthropic
         .stream_messages_with_lease(lease, body_value)
         .await
     {
         Ok(stream) => stream,
-        Err(err) => return upstream_error_response(err),
+        Err(err) => {
+            state
+                .metrics
+                .record_failure(&key_id, &model, started.elapsed());
+            return upstream_error_response(err);
+        }
     };
 
     // Splice the upstream byte stream straight into the client's
@@ -386,12 +496,28 @@ async fn anthropic_passthrough(
     // expects. We translate `NimClientError::Stream` into a synthetic
     // SSE `event: error` frame so the Anthropic client can surface a
     // useful message to the user instead of silently truncating.
+    //
+    // Token usage on this path can't be parsed by a structured
+    // deserializer without breaking the byte-perfect passthrough
+    // contract, so we sniff the SSE bytes for the latest
+    // `"input_tokens"` / `"output_tokens"` integers and fall back to
+    // the local input estimate when the upstream doesn't emit a usage
+    // block at all.
+    let metrics = state.metrics.clone();
+    let key_id_for_stream = key_id.clone();
+    let model_for_stream = model.clone();
     let mapped = stream! {
+        let mut sniffer = UsageSniffer::new();
+        let mut had_error = false;
         futures_util::pin_mut!(upstream);
         while let Some(item) = upstream.next().await {
             match item {
-                Ok(bytes) => yield Ok::<Bytes, std::io::Error>(bytes),
+                Ok(bytes) => {
+                    sniffer.observe(&bytes);
+                    yield Ok::<Bytes, std::io::Error>(bytes);
+                }
                 Err(err) => {
+                    had_error = true;
                     let frame = format!(
                         "event: error\ndata: {{\"type\":\"error\",\"message\":\"{}\"}}\n\n",
                         err.to_string().replace('"', "\\\"")
@@ -400,6 +526,14 @@ async fn anthropic_passthrough(
                     break;
                 }
             }
+        }
+        let elapsed = started.elapsed();
+        if had_error {
+            metrics.record_failure(&key_id_for_stream, &model_for_stream, elapsed);
+        } else {
+            let input = if sniffer.saw_input { sniffer.input_tokens } else { estimated_input };
+            let output = if sniffer.saw_output { sniffer.output_tokens } else { 0 };
+            metrics.record_success(&key_id_for_stream, &model_for_stream, input, output, elapsed);
         }
     };
 

@@ -109,6 +109,57 @@ impl NimClient {
         &self.key_pool
     }
 
+    /// Fetch the model catalog of an upstream addressed by the supplied
+    /// `base_url` + `key`, bypassing the key pool entirely. Used by the
+    /// GUI to populate the autocomplete dropdown of the *currently
+    /// edited* credential — we cannot route through the pool because
+    /// the user might be editing a key whose live entry hasn't been
+    /// rebuilt yet (or is `Disabled` / `Expired`).
+    ///
+    /// `provider` is consulted only to validate that the upstream
+    /// actually exposes `/models`; Anthropic-compatible hosts return
+    /// an explicit error so callers can show a friendlier message
+    /// instead of a `404`.
+    pub async fn list_models_direct(
+        &self,
+        provider: ProviderKind,
+        base_url: &str,
+        key: &str,
+    ) -> NimResult<NimModelList> {
+        if matches!(provider, ProviderKind::AnthropicCompat) {
+            return Err(NimClientError::Request(
+                "Anthropic-compatible upstreams do not expose /models".to_string(),
+            ));
+        }
+        let trimmed = base_url.trim().trim_end_matches('/');
+        let base = if trimmed.is_empty() {
+            provider.default_base_url().trim_end_matches('/')
+        } else {
+            trimmed
+        };
+        if base.is_empty() {
+            return Err(NimClientError::Request(
+                "missing upstream base URL for this provider".to_string(),
+            ));
+        }
+        let mut request = self.http.get(format!("{base}/models"));
+        if !key.trim().is_empty() {
+            request = request.bearer_auth(key.trim());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| NimClientError::Request(e.to_string()))?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(NimClientError::Request(format!("HTTP {status}")));
+        }
+        response
+            .json::<NimModelList>()
+            .await
+            .map_err(|e| NimClientError::Request(e.to_string()))
+    }
+
     /// Stream a chat completion via an OpenAI-compatible upstream using
     /// an already-acquired key lease. The caller (typically the proxy
     /// server) is in charge of picking the lease — that lets the server

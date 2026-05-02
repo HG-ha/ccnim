@@ -12,6 +12,7 @@ axum.workspace = true
 bytes = "1"
 futures-util.workspace = true
 nim-client = { path = "../nim-client" }
+parking_lot.workspace = true
 proxy-core = { path = "../proxy-core" }
 serde.workspace = true
 serde_json.workspace = true

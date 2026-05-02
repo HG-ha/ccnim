@@ -42,9 +42,10 @@ fn save_config(config: AppConfig, state: State<'_, AppState>) -> Result<(), Stri
     // keys whose secret value is unchanged — see KeyPool::update_keys.
     if let Ok(guard) = state.server.lock() {
         if let Some(server) = guard.as_ref() {
-            server
-                .key_pool()
-                .update_keys(key_pool_entries(&config.nim_api_keys));
+            server.key_pool().update_keys(key_pool_entries(
+                &config.nim_api_keys,
+                config.rate_limit_per_key,
+            ));
         }
     }
     Ok(())
@@ -82,17 +83,22 @@ fn proxy_status(state: State<'_, AppState>) -> Result<ProxyStatus, String> {
     // When the proxy is up, surface snapshots from the *live* KeyPool so the
     // dashboard reflects real inflight/recent counts and health transitions.
     // When stopped, fall back to a fresh pool so the user still sees the keys
-    // they have configured.
+    // they have configured. The metrics registry only exists while the
+    // proxy is running (counters are intentionally per-run), so we send
+    // `None` in the stopped case and the dashboard hides the live cards.
     let guard = state.server.lock().map_err(|_| "server lock poisoned")?;
-    let (running, keys) = match guard.as_ref() {
-        Some(server) => (true, server.key_pool().snapshots()),
+    let (running, keys, metrics) = match guard.as_ref() {
+        Some(server) => (
+            true,
+            server.key_pool().snapshots(),
+            Some(server.metrics_snapshot()),
+        ),
         None => {
             let pool = KeyPool::new(
-                key_pool_entries(&config.nim_api_keys),
-                config.rate_limit_per_key,
+                key_pool_entries(&config.nim_api_keys, config.rate_limit_per_key),
                 std::time::Duration::from_secs(config.rate_window_secs),
             );
-            (false, pool.snapshots())
+            (false, pool.snapshots(), None)
         }
     };
     drop(guard);
@@ -102,6 +108,7 @@ fn proxy_status(state: State<'_, AppState>) -> Result<ProxyStatus, String> {
         listen_url: format!("http://{}:{}", config.host, config.port),
         default_model: config.model_mapping.default_model,
         keys,
+        metrics,
     })
 }
 
@@ -132,15 +139,6 @@ fn app_version() -> &'static str {
 }
 
 #[tauri::command]
-fn read_diagnostic_log() -> Result<String, String> {
-    let path = AppConfig::diagnostic_log_path().map_err(|e| e.to_string())?;
-    if !path.exists() {
-        return Ok(String::new());
-    }
-    std::fs::read_to_string(&path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))
-}
-
-#[tauri::command]
 async fn fetch_nim_models(
     provider: Option<proxy_core::ProviderKind>,
 ) -> Result<proxy_core::NimModelList, String> {
@@ -150,13 +148,41 @@ async fn fetch_nim_models(
     }
     let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
     let key_pool = KeyPool::new(
-        key_pool_entries(&config.nim_api_keys),
-        config.rate_limit_per_key,
+        key_pool_entries(&config.nim_api_keys, config.rate_limit_per_key),
         std::time::Duration::from_secs(config.rate_window_secs),
     );
     let client = NimClient::new(key_pool).map_err(|e| e.to_string())?;
     client
         .list_models(provider)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Fetch the model catalog for a single configured key, addressed by
+/// its stable `id`. Lets the GUI populate the autocomplete dropdown
+/// inside the edit-key card with models that *that specific upstream*
+/// actually exposes, instead of mixing entries from every configured
+/// key together. Anthropic-compatible keys (which have no `/models`
+/// endpoint) return an explicit, user-readable error.
+#[tauri::command]
+async fn fetch_models_for_key(key_id: String) -> Result<proxy_core::NimModelList, String> {
+    let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
+    let key = config
+        .nim_api_keys
+        .iter()
+        .find(|k| k.id == key_id)
+        .ok_or_else(|| format!("找不到 ID 为 {key_id} 的 Key"))?;
+    if matches!(key.provider, proxy_core::ProviderKind::AnthropicCompat) {
+        return Err("Anthropic 兼容上游不暴露 /models，请直接手动填写模型名".to_string());
+    }
+    // We always create a fresh, throw-away pool here — the call must not
+    // rely on the live runtime pool because the user may be editing a
+    // key whose value just changed (live pool would still hold the
+    // previous credential), or the proxy may not be running at all.
+    let key_pool = KeyPool::new(Vec::new(), std::time::Duration::from_secs(60));
+    let client = NimClient::new(key_pool).map_err(|e| e.to_string())?;
+    client
+        .list_models_direct(key.provider, &key.effective_base_url(), &key.value)
         .await
         .map_err(|e| e.to_string())
 }
@@ -173,7 +199,7 @@ fn open_claude_terminal(cwd: String) -> Result<(), String> {
     open_terminal_with_claude(&cwd, &base_url, &config.auth_token)
 }
 #[tauri::command]
-fn open_claude_desktop(state: State<'_, AppState>) -> Result<String, String> {
+fn open_claude_desktop(state: State<'_, AppState>) -> Result<bool, String> {
     let config = AppConfig::load_or_default().map_err(|e| e.to_string())?;
     let proxy_url = format!("http://{}:{}", config.host, config.port);
     let auth_token = config.auth_token.clone();
@@ -218,7 +244,7 @@ fn open_claude_desktop(state: State<'_, AppState>) -> Result<String, String> {
             .map_err(|e| format!("无法启动 Claude Desktop: {e}"))?;
     }
 
-    Ok("配置文件已写入。\n\n后续步骤：\n1. 首次使用需要在 Claude Desktop 中启用开发者模式\n2. 打开 Claude Desktop → Help → Troubleshooting → Enable Developer Mode\n3. 重启 Claude Desktop\n4. 进入 Settings → Claude Code → Developer → Configure Third-party Inference\n5. 配置 Base URL 和 API Key，点击 Apply Locally".to_string())
+    Ok(true)
 }
 
 /// 配置 Claude Desktop 免登录模式
@@ -481,9 +507,9 @@ fn main() {
             stop_proxy,
             proxy_status,
             fetch_nim_models,
+            fetch_models_for_key,
             open_claude_terminal,
             open_claude_desktop,
-            read_diagnostic_log,
             scan_ides,
             apply_ide_settings,
             app_version,

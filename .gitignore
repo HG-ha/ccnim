@@ -21,3 +21,6 @@ src-tauri/gen/
 .nimcode/
 .sandbox-home/
 .sandbox-tmp/
+
+# MacOS
+.DS_Store

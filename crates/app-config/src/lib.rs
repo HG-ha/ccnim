@@ -53,11 +53,21 @@ pub struct NimApiKey {
     /// Whether this key is enabled. Defaults to true for backwards compatibility.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Model mapping for this specific key. If None, falls back to global
-    /// AppConfig.model_mapping. This allows per-key customization when different
-    /// upstreams have different available models.
+    /// Per-key override for the global `AppConfig.model_mapping`. Each
+    /// field falls back to the global mapping independently when left
+    /// `None` / empty, so a user can override only `sonnet_model` for a
+    /// given upstream without having to repeat the rest of the mapping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_mapping: Option<ModelMappingConfig>,
+    pub model_mapping: Option<PerKeyModelMappingConfig>,
+    /// Per-key request rate limit (requests per `rate_window_secs`).
+    /// When `None`, the runtime falls back to a provider-specific
+    /// default — NIM uses the global `AppConfig.rate_limit_per_key`
+    /// (matching the upstream's published 40 RPM cap), while
+    /// OpenAI- / Anthropic-compatible upstreams default to *no*
+    /// per-key limit because their published quotas vary widely
+    /// between hosts and most users would rather pin them themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -80,6 +90,7 @@ impl NimApiKey {
             base_url: String::new(),
             enabled: true,
             model_mapping: None,
+            rate_limit: None,
         }
     }
 
@@ -91,6 +102,35 @@ impl NimApiKey {
             normalize_base_url(self.provider.default_base_url())
         } else {
             normalize_base_url(&self.base_url)
+        }
+    }
+
+    /// Resolve the per-key rate limit (requests per the configured
+    /// window). Returns `None` when the key should be treated as
+    /// unlimited.
+    ///
+    /// Resolution order:
+    ///   1. User-supplied [`Self::rate_limit`] takes precedence.
+    ///      A zero is treated as "unlimited" rather than "block all";
+    ///      "block all" isn't a useful UX and a 0 in a number input
+    ///      almost always means the user wants the cap removed.
+    ///   2. Otherwise the provider default applies — NIM keeps the
+    ///      historic global cap (`default_nim_limit`), and OpenAI- /
+    ///      Anthropic-compatible upstreams are unlimited so quota
+    ///      handling lives entirely on the upstream's side until the
+    ///      user opts in.
+    pub fn effective_rate_limit(&self, default_nim_limit: usize) -> Option<usize> {
+        if let Some(n) = self.rate_limit {
+            if n == 0 {
+                None
+            } else {
+                Some(n as usize)
+            }
+        } else {
+            match self.provider {
+                ProviderKind::Nim => Some(default_nim_limit),
+                ProviderKind::OpenaiCompat | ProviderKind::AnthropicCompat => None,
+            }
         }
     }
 }
@@ -123,6 +163,38 @@ pub struct ModelMappingConfig {
     pub opus_model: Option<String>,
     pub sonnet_model: Option<String>,
     pub haiku_model: Option<String>,
+}
+
+/// Per-key model mapping override. All fields are optional because each
+/// one falls back to the corresponding global field when left empty —
+/// so the user can configure just the overrides that actually differ
+/// for this upstream and inherit the rest. Empty strings are treated
+/// as "not set" by the runtime, so the GUI can persist `""` without
+/// regressing into a hard override.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct PerKeyModelMappingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonnet_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haiku_model: Option<String>,
+}
+
+impl PerKeyModelMappingConfig {
+    /// `true` when every field is unset / blank — i.e. there is no
+    /// effective override at all, and the runtime can skip the merge
+    /// entirely. Lets callers normalise `Some(empty)` into `None` on
+    /// save so we don't litter `secrets.json` with no-op objects.
+    pub fn is_empty(&self) -> bool {
+        let blank = |s: &Option<String>| s.as_deref().map(str::trim).unwrap_or("").is_empty();
+        blank(&self.default_model)
+            && blank(&self.opus_model)
+            && blank(&self.sonnet_model)
+            && blank(&self.haiku_model)
+    }
 }
 
 impl Default for AppConfig {

@@ -26,6 +26,11 @@ type NimApiKey = {
     sonnet_model?: string | null;
     haiku_model?: string | null;
   };
+  /// Per-key rate-limit override (requests per the global window).
+  /// `null` / undefined means "use the provider default": NIM picks
+  /// the global `rate_limit_per_key`, while other providers have no
+  /// local cap by default.
+  rate_limit?: number | null;
 };
 
 type AppConfig = {
@@ -46,6 +51,10 @@ type AppConfig = {
 
 type KeySnapshot = {
   id: number;
+  /// Stable identifier (matches `NimApiKey.id`). Used to attach
+  /// per-key live metrics so usage history follows the key across
+  /// edits / pool rebuilds.
+  stable_id?: string;
   masked: string;
   label?: string | null;
   expires_at?: number | null;
@@ -55,6 +64,46 @@ type KeySnapshot = {
   inflight: number;
   recent_requests: number;
   failure_count: number;
+  /// Effective rate-limit cap resolved by the backend (per-key
+  /// override or provider default). `null` means "no local cap" —
+  /// the GUI renders this as "不限" instead of `recent / 0`.
+  rate_limit?: number | null;
+};
+
+/// Live per-key statistics surfaced by the running proxy. `None` on
+/// the wire when the proxy is stopped.
+type KeyMetrics = {
+  stable_id: string;
+  requests: number;
+  successes: number;
+  failures: number;
+  input_tokens: number;
+  output_tokens: number;
+  avg_latency_ms: number;
+  last_latency_ms: number;
+  last_request_at: number;
+};
+
+type ModelMetrics = {
+  model: string;
+  calls: number;
+  successes: number;
+  failures: number;
+  input_tokens: number;
+  output_tokens: number;
+  last_used_at: number;
+};
+
+type MetricsSnapshot = {
+  started_at: number;
+  uptime_secs: number;
+  total_requests: number;
+  total_successes: number;
+  total_failures: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  keys: KeyMetrics[];
+  models: ModelMetrics[];
 };
 
 /// Provider metadata for UI rendering and validation. The defaults come
@@ -114,6 +163,9 @@ type ProxyStatus = {
   listen_url: string;
   default_model: string;
   keys: KeySnapshot[];
+  /// Present only while the proxy is running — counters live in the
+  /// running server's memory and reset on stop/start.
+  metrics?: MetricsSnapshot | null;
 };
 
 type IdeProfile = {
@@ -148,7 +200,6 @@ let toastTimer: number | undefined;
 let statusTimer: number | undefined;
 let modelsTimer: number | undefined;
 let showToken = false;
-let diagnosticLog = "";
 let ideProfiles: IdeProfile[] = [];
 let idesScanning = false;
 let idesScanError: string | null = null;
@@ -170,6 +221,10 @@ const MODELS_REFRESH_MS = 30 * 60 * 1000;
 type AddPanelMode = "single" | "batch" | null;
 let addPanel: AddPanelMode = null;
 let editingKeyId: string | null = null;
+/// Tracks the document-level Esc keydown handler the edit modal
+/// installs, so subsequent re-renders during the same edit session can
+/// detach the previous one before attaching a fresh one.
+let editModalEscHandler: ((ev: KeyboardEvent) => void) | null = null;
 
 /// Per-form scratch state. `baseUrl` is what the user typed (empty
 /// string means "fall back to provider default" — the backend honours
@@ -182,6 +237,10 @@ const singleAdd = {
   expiresAt: "",
   provider: "nim" as ProviderKind,
   baseUrl: "",
+  /// Rate-limit input as a string so the user can clear it back to
+  /// "" (= inherit provider default). Parsed by `parseRateLimit` at
+  /// submit time.
+  rateLimit: "",
 };
 const batchAdd = {
   values: "",
@@ -189,15 +248,32 @@ const batchAdd = {
   expiresAt: "",
   provider: "nim" as ProviderKind,
   baseUrl: "",
+  rateLimit: "",
 };
+/// Edit form state for an existing key card. The model-mapping fields
+/// are stored as plain strings (`""` means "inherit"); they get
+/// normalised into `null`s by `submitEditKey` before crossing the IPC
+/// boundary so the Rust side sees a tidy `Option<String>`.
+///
+/// `availableModels` is populated lazily by `refreshEditAvailableModels`
+/// — when the user opens the card we kick off a per-key
+/// `fetch_models_for_key` call so the autocomplete dropdown shows
+/// models that *this* upstream actually serves, instead of the ones
+/// from whichever key happened to win the global fetch race.
 const editForm = {
-    value: "",
-    label: "",
-    expiresAt: "",
-    provider: "nim" as ProviderKind,
-    baseUrl: "",
-    modelMapping: { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" },
-  };
+  value: "",
+  label: "",
+  expiresAt: "",
+  provider: "nim" as ProviderKind,
+  baseUrl: "",
+  modelMapping: { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" },
+  availableModels: [] as string[],
+  modelsLoading: false,
+  modelsError: null as string | null,
+  /// Per-key rate-limit override as a free-text input. "" means
+  /// "inherit the provider default"; a positive integer overrides it.
+  rateLimit: "",
+};
 
 const appWindow = getCurrentWindow();
 
@@ -542,15 +618,6 @@ async function openClaudeDesktopApp() {
  }
 }
 
-async function refreshDiagnostic() {
-  try {
-    diagnosticLog = await invoke<string>("read_diagnostic_log");
-    render();
-  } catch (error) {
-    toast(`读取诊断日志失败: ${error}`, "error");
-  }
-}
-
 /// Refresh the list of detected IDEs. Pulls every known VSCode-family
 /// vendor directory (`Code`, `Cursor`, `Windsurf`, ...) and reports back
 /// which `settings.json` files exist + what they currently set under
@@ -638,6 +705,7 @@ async function submitSingleAdd() {
     expires_at: datetimeLocalToUnix(singleAdd.expiresAt),
     provider: singleAdd.provider,
     base_url: singleAdd.baseUrl.trim().replace(/\/$/, ""),
+    rate_limit: parseRateLimit(singleAdd.rateLimit),
   };
   config.nim_api_keys.push(newKey);
   if (!(await save(true))) {
@@ -684,6 +752,7 @@ async function submitBatchImport() {
   const sharedExpiry = datetimeLocalToUnix(batchAdd.expiresAt);
   const sharedLabel = batchAdd.labelPrefix.trim() || null;
   const sharedBaseUrl = batchAdd.baseUrl.trim().replace(/\/$/, "");
+  const sharedRateLimit = parseRateLimit(batchAdd.rateLimit);
   const newKeys: NimApiKey[] = [];
   let skipped = 0;
   for (const raw of candidates) {
@@ -699,6 +768,7 @@ async function submitBatchImport() {
       expires_at: sharedExpiry,
       provider: batchAdd.provider,
       base_url: sharedBaseUrl,
+      rate_limit: sharedRateLimit,
     };
     config.nim_api_keys.push(k);
     newKeys.push(k);
@@ -732,21 +802,65 @@ function beginEditKey(id: string) {
   editForm.expiresAt = unixToDatetimeLocal(key.expires_at);
   editForm.provider = key.provider ?? "nim";
   editForm.baseUrl = key.base_url ?? "";
-  // Load model mapping if configured for this key
+  editForm.rateLimit =
+    typeof key.rate_limit === "number" && key.rate_limit > 0 ? String(key.rate_limit) : "";
   if (key.model_mapping) {
     editForm.modelMapping = {
-      defaultModel: key.model_mapping.default_model || "",
-      opusModel: key.model_mapping.opus_model || "",
-      sonnetModel: key.model_mapping.sonnet_model || "",
-      haikuModel: key.model_mapping.haiku_model || "",
+      defaultModel: key.model_mapping.default_model ?? "",
+      opusModel: key.model_mapping.opus_model ?? "",
+      sonnetModel: key.model_mapping.sonnet_model ?? "",
+      haikuModel: key.model_mapping.haiku_model ?? "",
     };
   } else {
-    // Clear model mapping
     editForm.modelMapping = { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" };
   }
+  // Seed the dropdown with the global cache so it's never empty during
+  // the round-trip; the per-key fetch below will replace it as soon as
+  // the upstream responds.
+  editForm.availableModels = models;
+  editForm.modelsLoading = false;
+  editForm.modelsError = null;
   editingKeyId = id;
   addPanel = null;
   render();
+  void refreshEditAvailableModels(id);
+}
+
+/// Pull the model catalog for a single configured key and stash it on
+/// `editForm.availableModels`. Re-renders only when the editor is still
+/// open for *this* key, so a slow response that lands after the user
+/// already cancelled / switched cards doesn't snap the UI back open.
+async function refreshEditAvailableModels(keyId: string) {
+  const key = config?.nim_api_keys.find((k) => k.id === keyId);
+  if (!key) return;
+  if ((key.provider ?? "nim") === "anthropic_compat") {
+    editForm.availableModels = [];
+    editForm.modelsLoading = false;
+    editForm.modelsError =
+      "Anthropic 兼容上游不暴露 /models，请直接手动填写模型 ID";
+    if (editingKeyId === keyId) render();
+    return;
+  }
+  editForm.modelsLoading = true;
+  editForm.modelsError = null;
+  if (editingKeyId === keyId) render();
+  try {
+    const response = await invoke<{ data: Array<{ id: string }> }>(
+      "fetch_models_for_key",
+      { keyId },
+    );
+    if (editingKeyId !== keyId) return;
+    editForm.availableModels = response.data.map((m) => m.id).sort();
+    editForm.modelsError = null;
+  } catch (error) {
+    if (editingKeyId !== keyId) return;
+    editForm.modelsError = String(error);
+  } finally {
+    if (editingKeyId === keyId) {
+      editForm.modelsLoading = false;
+      render();
+    }
+  }
 }
 
 function cancelEdit() {
@@ -780,6 +894,8 @@ async function submitEditKey(id: string) {
     expires_at: datetimeLocalToUnix(editForm.expiresAt),
     provider: editForm.provider,
     base_url: editForm.baseUrl.trim().replace(/\/$/, ""),
+    model_mapping: buildPerKeyModelMapping(editForm.modelMapping),
+    rate_limit: parseRateLimit(editForm.rateLimit),
   };
   if (!(await save(true))) {
     config.nim_api_keys[idx] = before;
@@ -788,6 +904,64 @@ async function submitEditKey(id: string) {
   toast("已更新该 Key", "success");
   editingKeyId = null;
   render();
+}
+
+/// Pack the four free-text fields back into a `model_mapping` object,
+/// returning `undefined` when every field is blank. This is what makes
+/// the persisted JSON tidy: a key with no overrides serialises as a
+/// plain credential record without a redundant `"model_mapping": {}`.
+function buildPerKeyModelMapping(form: {
+  defaultModel: string;
+  opusModel: string;
+  sonnetModel: string;
+  haikuModel: string;
+}): NimApiKey["model_mapping"] | undefined {
+  const trim = (s: string) => {
+    const t = s.trim();
+    return t.length === 0 ? null : t;
+  };
+  const defaultModel = trim(form.defaultModel);
+  const opusModel = trim(form.opusModel);
+  const sonnetModel = trim(form.sonnetModel);
+  const haikuModel = trim(form.haikuModel);
+  if (!defaultModel && !opusModel && !sonnetModel && !haikuModel) return undefined;
+  const mapping: NonNullable<NimApiKey["model_mapping"]> = {};
+  if (defaultModel) mapping.default_model = defaultModel;
+  if (opusModel) mapping.opus_model = opusModel;
+  if (sonnetModel) mapping.sonnet_model = sonnetModel;
+  if (haikuModel) mapping.haiku_model = haikuModel;
+  return mapping;
+}
+
+/// Convert a free-form rate-limit input back into the wire shape:
+///   - empty / non-numeric / ≤ 0 → `null` (use provider default)
+///   - positive integer  → that integer
+///
+/// We deliberately collapse "" and bad input to `null` instead of
+/// rejecting the form. The backend already treats `null` and `0` as
+/// "inherit / unlimited", so this matches users' expectation that
+/// "leave it blank" means "use whatever the default is".
+function parseRateLimit(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) return null;
+  return n;
+}
+
+/// Placeholder text shown beneath the rate-limit input. Spelled out
+/// per provider so the user knows whether leaving it blank means "use
+/// the global NIM cap" or "no local cap at all".
+function rateLimitPlaceholder(provider: ProviderKind): string {
+  if (provider === "nim") {
+    const def = config?.rate_limit_per_key ?? 40;
+    return `留空 → 走 NIM 默认 ${def} 次 / ${rateLimitWindow()} 秒`;
+  }
+  return `留空 → 不限速（由上游配额决定）`;
+}
+
+function rateLimitWindow(): number {
+  return config?.rate_window_secs ?? 60;
 }
 
 async function deleteKey(id: string) {
@@ -1050,6 +1224,7 @@ function render() {
       </main>
     </div>
     ${renderUpdateModal()}
+    ${renderEditModal()}
   `;
 
   bind();
@@ -1077,13 +1252,6 @@ function renderView(): string {
     default:
       return renderDashboard();
   }
-}
-
-function rateLimitOf(): { limit: number; window: number } {
-  return {
-    limit: config?.rate_limit_per_key ?? 40,
-    window: config?.rate_window_secs ?? 60,
-  };
 }
 
 function renderUpdateBanner(): string {
@@ -1211,14 +1379,20 @@ function renderDashboard(): string {
   const keys = proxyStatus?.keys ?? [];
   const healthyKeys = keys.filter((k) => normalizeState(k.state) === "healthy").length;
   const totalInflight = keys.reduce((sum, k) => sum + k.inflight, 0);
-  const totalRecent = keys.reduce((sum, k) => sum + k.recent_requests, 0);
-  const { limit } = rateLimitOf();
+  const metrics = proxyStatus?.metrics ?? null;
+
+  const totalReq = metrics?.total_requests ?? 0;
+  const totalOk = metrics?.total_successes ?? 0;
+  const totalFail = metrics?.total_failures ?? 0;
+  const totalIn = metrics?.total_input_tokens ?? 0;
+  const totalOut = metrics?.total_output_tokens ?? 0;
+  const successRate = totalReq > 0 ? `${((totalOk / totalReq) * 100).toFixed(1)}%` : "—";
 
   return `
     <header class="page-header">
       <div>
         <h1>仪表盘 ${updateState.currentVersion ? `<span class="version-pill">v${escapeHtml(updateState.currentVersion)}</span>` : ""}</h1>
-        <p>本地 Anthropic 兼容代理，使用 NVIDIA NIM 作为上游提供 Claude Code 服务。</p>
+        <p>本地 Anthropic 兼容代理 — 实时跟踪每个 Key 的用量、健康度与 Token 消耗。</p>
       </div>
       <div class="header-actions">
         <button id="checkUpdate" class="btn-ghost" ${updateState.stage === "checking" ? "disabled" : ""}>
@@ -1241,130 +1415,283 @@ function renderDashboard(): string {
         <div class="metric-sub mono">${escapeHtml(listenUrl)}</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">默认模型</div>
-        <div class="metric-value mono">${escapeHtml(config.model_mapping.default_model)}</div>
-        <div class="metric-sub">Anthropic → NIM 路由</div>
-      </div>
-      <div class="metric-card">
         <div class="metric-label">API Keys</div>
-        <div class="metric-value">${healthyKeys}<span style="font-size:14px;color:var(--text-dim);font-weight:600"> / ${keyCount}</span></div>
-        <div class="metric-sub">${keyCount === 0 ? "未配置 Key" : `${healthyKeys} 个健康 · 总配额 ${keyCount * limit}/分钟`}</div>
+        <div class="metric-value">${healthyKeys}<span class="metric-sup"> / ${keyCount}</span></div>
+        <div class="metric-sub">${keyCount === 0 ? "未配置 Key" : `${healthyKeys} 健康 · ${totalInflight} 并发`}</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">实时请求</div>
-        <div class="metric-value">${totalInflight}<span style="font-size:14px;color:var(--text-dim);font-weight:600"> 进行中</span></div>
-        <div class="metric-sub">最近 ${rateLimitOf().window}s 共 ${totalRecent} 次</div>
+        <div class="metric-label">累计请求</div>
+        <div class="metric-value">${formatCount(totalReq)}</div>
+        <div class="metric-sub">成功率 ${successRate} · 失败 ${formatCount(totalFail)}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Token 消耗</div>
+        <div class="metric-value">${formatTokenCount(totalIn + totalOut)}</div>
+        <div class="metric-sub">输入 ${formatTokenCount(totalIn)} · 输出 ${formatTokenCount(totalOut)}</div>
       </div>
     </div>
 
     <section class="card">
       <div class="card-head">
         <div>
-          <h2>快速操作</h2>
-          <p>启动代理后，使用一键启动按钮就能在外部终端打开已注入环境变量的 Claude Code。</p>
-        </div>
-      </div>
-      <div class="quick-grid">
-        <button id="openClaude" class="quick-btn primary" ${isRunning ? "" : "disabled"}>
-          <strong>打开预配置终端</strong>
-          <span>已注入环境变量，cd 到项目目录后运行 claude</span>
-        </button>
-        <button class="quick-btn" data-nav="keys">
-          <strong>管理 API Keys</strong>
-          <span>多 Key 自动切换 · ${limit} 次/分钟 限速</span>
-        </button>
-        <button class="quick-btn" data-nav="models">
-          <strong>模型映射</strong>
-          <span>Opus / Sonnet / Haiku → NIM</span>
-        </button>
-        <button class="quick-btn" data-nav="ide">
-          <strong>IDE 接入指南</strong>
-          <span>VSCode / Cursor / JetBrains 中安装 Claude Code 插件</span>
-        </button>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <div>
-          <h2>API Key 健康概览</h2>
-          <p>每个 Key 的实时状态、并发请求与最近窗口用量，按健康度自动切换。</p>
+          <h2>API Key 用量</h2>
+          <p>${
+            isRunning
+              ? "每个 Key 的并发、用量、Token 消耗与平均响应时间，自启动以来累计。"
+              : "启动代理后这里会显示每个 Key 的实时用量与 Token 消耗。"
+          }</p>
         </div>
         <button class="btn-ghost" data-nav="keys">前往管理 →</button>
       </div>
-      <div id="keyList">${renderKeyList(keys, 6)}</div>
+      <div id="dashKeyTable">${renderDashboardKeyTable(keys, metrics)}</div>
     </section>
 
     <section class="card">
       <div class="card-head">
         <div>
-          <h2>诊断日志</h2>
-          <p>记录每次配置加载/保存的结果（包括 secrets.json 写入后的回读校验），方便排查"保存的 Key 未持久化"等问题。</p>
-        </div>
-        <div style="display:flex;gap:8px">
-          <button id="diagRefresh" class="btn-ghost">刷新</button>
+          <h2>模型调用排行</h2>
+          <p>按调用次数倒序排列，统计代理启动以来每个上游模型的请求量与 Token 用量。</p>
         </div>
       </div>
-      ${
-        diagnosticLog
-          ? `<pre class="diag-pre selectable">${escapeHtml(diagnosticLog.split("\n").slice(-40).join("\n"))}</pre>`
-          : `<div class="empty"><strong>暂无诊断日志</strong><br/>点击"刷新"加载最近 40 条；或保存配置/重启代理后再来这里查看 secrets.json 读写结果。</div>`
-      }
+      <div id="dashModelTable">${renderDashboardModelTable(metrics)}</div>
     </section>
   `;
 }
 
-function renderKeyList(keys: KeySnapshot[], limit?: number): string {
+/// Patch only the four metric tiles + the two tables on the dashboard.
+/// Avoids a full `render()` per tick so the user's scroll position
+/// survives across the polling cadence.
+function refreshDashboardLiveSections() {
+  if (!config) return;
+  const isRunning = proxyStatus?.running ?? false;
+  const keys = proxyStatus?.keys ?? [];
+  const metrics = proxyStatus?.metrics ?? null;
+  const totalReq = metrics?.total_requests ?? 0;
+  const totalOk = metrics?.total_successes ?? 0;
+  const totalFail = metrics?.total_failures ?? 0;
+  const totalIn = metrics?.total_input_tokens ?? 0;
+  const totalOut = metrics?.total_output_tokens ?? 0;
+  const successRate = totalReq > 0 ? `${((totalOk / totalReq) * 100).toFixed(1)}%` : "—";
+  const healthyKeys = keys.filter((k) => normalizeState(k.state) === "healthy").length;
+  const totalInflight = keys.reduce((sum, k) => sum + k.inflight, 0);
+  const keyCount = config.nim_api_keys.length;
+
+  const grid = document.querySelector<HTMLDivElement>(".metric-grid");
+  if (grid) {
+    const listenUrl = proxyStatus?.listen_url || `http://${config.host}:${config.port}`;
+    grid.innerHTML = `
+      <div class="metric-card ${isRunning ? "metric-ok" : ""}">
+        <div class="metric-label">代理状态</div>
+        <div class="metric-value">${isRunning ? "运行中" : "未启动"}</div>
+        <div class="metric-sub mono">${escapeHtml(listenUrl)}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">API Keys</div>
+        <div class="metric-value">${healthyKeys}<span class="metric-sup"> / ${keyCount}</span></div>
+        <div class="metric-sub">${keyCount === 0 ? "未配置 Key" : `${healthyKeys} 健康 · ${totalInflight} 并发`}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">累计请求</div>
+        <div class="metric-value">${formatCount(totalReq)}</div>
+        <div class="metric-sub">成功率 ${successRate} · 失败 ${formatCount(totalFail)}</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Token 消耗</div>
+        <div class="metric-value">${formatTokenCount(totalIn + totalOut)}</div>
+        <div class="metric-sub">输入 ${formatTokenCount(totalIn)} · 输出 ${formatTokenCount(totalOut)}</div>
+      </div>
+    `;
+  }
+
+  const keyTable = document.getElementById("dashKeyTable");
+  if (keyTable) keyTable.innerHTML = renderDashboardKeyTable(keys, metrics);
+
+  const modelTable = document.getElementById("dashModelTable");
+  if (modelTable) modelTable.innerHTML = renderDashboardModelTable(metrics);
+}
+
+/// One row per configured key, joined against `metrics.keys` by stable
+/// id. Keys with no traffic yet still appear, with zeros — that's the
+/// signal the user uses to spot rotated-but-unused upstreams.
+function renderDashboardKeyTable(
+  keys: KeySnapshot[],
+  metrics: MetricsSnapshot | null,
+): string {
   if (keys.length === 0) {
     const configured = config?.nim_api_keys.length ?? 0;
     if (configured === 0) {
-      return `<div class="empty"><strong>尚未配置 NVIDIA NIM API Key</strong><br/>前往 "API Keys" 页面添加 nvapi- 开头的 Key。</div>`;
+      return `<div class="empty"><strong>尚未配置 API Key</strong><br/>前往 "API Keys" 页面添加后这里会出现实时用量。</div>`;
     }
-    if (!proxyStatus?.running) {
-      return `<div class="empty"><strong>已配置 ${configured} 个 Key</strong><br/>启动代理后这里会显示每个 Key 的实时健康状态。</div>`;
-    }
-    return `<div class="empty"><strong>正在收集运行数据…</strong><br/>请等待几秒，或先发起一次请求触发统计。</div>`;
+    return `<div class="empty"><strong>已配置 ${configured} 个 Key</strong><br/>启动代理后这里会显示每个 Key 的运行指标。</div>`;
   }
-  const list = limit ? keys.slice(0, limit) : keys;
-  return `<div class="keys-grid">${list.map((k) => renderKeyCard(k)).join("")}</div>`;
-}
+  const byId = new Map<string, KeyMetrics>();
+  for (const m of metrics?.keys ?? []) byId.set(m.stable_id, m);
+  const rateWindow = rateLimitWindow();
 
-function renderKeyCard(k: KeySnapshot): string {
-  const { limit, window: rateWindow } = rateLimitOf();
-  const ratio = limit > 0 ? Math.min(1, k.recent_requests / limit) : 0;
-  const fillCls = ratio >= 0.9 ? "danger" : ratio >= 0.6 ? "warn" : "";
-  const widthPct = (ratio * 100).toFixed(1);
-  const stateNorm = normalizeState(k.state);
-  const expiry = formatExpiry(k.expires_at);
-  const providerMeta = PROVIDERS[k.provider];
-  const providerBadge = `<span class="badge badge-provider provider-${k.provider}" title="${escapeHtml(k.base_url)}">${escapeHtml(providerMeta.short)}</span>`;
+  const rows = keys
+    .map((k) => {
+      const m = byId.get(k.stable_id ?? "");
+      const stateNorm = normalizeState(k.state);
+      const provider = PROVIDERS[k.provider];
+      const requests = m?.requests ?? 0;
+      const successes = m?.successes ?? 0;
+      const failures = m?.failures ?? 0;
+      const inputTok = m?.input_tokens ?? 0;
+      const outputTok = m?.output_tokens ?? 0;
+      const avg = m?.avg_latency_ms ?? 0;
+      const last = m?.last_latency_ms ?? 0;
+      const ok = requests > 0 ? `${((successes / requests) * 100).toFixed(1)}%` : "—";
+      const limit = typeof k.rate_limit === "number" && k.rate_limit > 0 ? k.rate_limit : null;
+      const ratio = limit ? Math.min(1, k.recent_requests / limit) : 0;
+      const fillCls = ratio >= 0.9 ? "danger" : ratio >= 0.6 ? "warn" : "";
+      const widthPct = (ratio * 100).toFixed(1);
+      const usageCell = limit
+        ? `
+            <div class="dash-usage-num">${k.recent_requests}<span class="dash-usage-denom">/${limit}</span></div>
+            <div class="usage-bar-track tight"><div class="usage-bar-fill ${fillCls}" style="width:${widthPct}%"></div></div>
+            <div class="dash-cell-sub">${rateWindow}s 窗口 · 并发 ${k.inflight}</div>`
+        : `
+            <div class="dash-usage-num">${k.recent_requests}<span class="dash-usage-denom"> 次</span></div>
+            <div class="dash-cell-sub">不限速 · ${rateWindow}s 窗口 · 并发 ${k.inflight}</div>`;
+      const labelCell = k.label
+        ? `<div class="dash-key-label">${escapeHtml(k.label)}</div><div class="dash-key-mask mono">${escapeHtml(k.masked)}</div>`
+        : `<div class="dash-key-mask mono">${escapeHtml(k.masked)}</div>`;
+      return `
+        <tr class="dash-row state-${stateNorm}">
+          <td class="dash-cell-key">
+            <div class="dash-key-head">
+              <span class="key-num">#${k.id + 1}</span>
+              <span class="badge badge-provider provider-${k.provider}" title="${escapeHtml(k.base_url)}">${escapeHtml(provider.short)}</span>
+              ${keyStateBadge(k.state)}
+            </div>
+            ${labelCell}
+          </td>
+          <td>
+            <div class="dash-usage">${usageCell}
+            </div>
+          </td>
+          <td class="num">
+            <div class="dash-cell-strong">${formatCount(requests)}</div>
+            <div class="dash-cell-sub">成功率 ${ok}</div>
+          </td>
+          <td class="num">
+            <div class="dash-cell-strong ${failures > 0 ? "fail" : ""}">${formatCount(failures)}</div>
+            <div class="dash-cell-sub">连续失败 ${k.failure_count}</div>
+          </td>
+          <td class="num">
+            <div class="dash-cell-strong">${avg > 0 ? formatLatency(avg) : "—"}</div>
+            <div class="dash-cell-sub">最近 ${last > 0 ? formatLatency(last) : "—"}</div>
+          </td>
+          <td class="num">
+            <div class="dash-cell-strong">${formatTokenCount(inputTok)}</div>
+            <div class="dash-cell-sub">输入</div>
+          </td>
+          <td class="num">
+            <div class="dash-cell-strong">${formatTokenCount(outputTok)}</div>
+            <div class="dash-cell-sub">输出</div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
   return `
-    <div class="key-card state-${stateNorm} expiry-${expiry.tone}">
-      <div class="key-card-head">
-        <div class="key-id-row">
-          <span class="key-num">#${k.id + 1}</span>
-          ${providerBadge}
-          <span class="key-id selectable">${escapeHtml(k.masked)}</span>
-        </div>
-        ${keyStateBadge(k.state)}
-      </div>
-      ${k.label ? `<div class="key-label">${escapeHtml(k.label)}</div>` : ""}
-      <div class="usage-bar">
-        <div class="usage-bar-head">
-          <span>最近 ${rateWindow}s 用量</span>
-          <span class="usage-fraction">${k.recent_requests} / ${limit}</span>
-        </div>
-        <div class="usage-bar-track">
-          <div class="usage-bar-fill ${fillCls}" style="width:${widthPct}%"></div>
-        </div>
-      </div>
-      <dl class="key-meta">
-        <div><dt>并发</dt><dd>${k.inflight}</dd></div>
-        <div><dt>失败</dt><dd class="${k.failure_count > 0 ? "fail" : ""}">${k.failure_count}</dd></div>
-        <div class="key-expiry-row"><dt>到期</dt><dd class="expiry-${expiry.tone}">${escapeHtml(expiry.text)}</dd></div>
-      </dl>
+    <div class="dash-table-wrap">
+      <table class="dash-table">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>实时用量</th>
+            <th class="num">请求</th>
+            <th class="num">失败</th>
+            <th class="num">响应时间</th>
+            <th class="num">输入 Token</th>
+            <th class="num">输出 Token</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
     </div>
   `;
+}
+
+function renderDashboardModelTable(metrics: MetricsSnapshot | null): string {
+  if (!metrics || metrics.models.length === 0) {
+    return `<div class="empty"><strong>暂无模型调用数据</strong><br/>${
+      proxyStatus?.running
+        ? "发起一次请求后，这里会按模型聚合调用次数与 Token 消耗。"
+        : "启动代理并发起请求后，这里会显示模型调用排行。"
+    }</div>`;
+  }
+  const rows = metrics.models
+    .map((m, idx) => {
+      const ok = m.calls > 0 ? `${((m.successes / m.calls) * 100).toFixed(1)}%` : "—";
+      const total = m.input_tokens + m.output_tokens;
+      const last = m.last_used_at > 0 ? formatRelativeTime(m.last_used_at) : "—";
+      return `
+        <tr>
+          <td class="dash-rank">${idx + 1}</td>
+          <td class="dash-model mono selectable">${escapeHtml(m.model)}</td>
+          <td class="num"><div class="dash-cell-strong">${formatCount(m.calls)}</div><div class="dash-cell-sub">成功率 ${ok}</div></td>
+          <td class="num"><div class="dash-cell-strong">${formatTokenCount(m.input_tokens)}</div></td>
+          <td class="num"><div class="dash-cell-strong">${formatTokenCount(m.output_tokens)}</div></td>
+          <td class="num"><div class="dash-cell-strong">${formatTokenCount(total)}</div></td>
+          <td class="dash-cell-sub">${escapeHtml(last)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+  return `
+    <div class="dash-table-wrap">
+      <table class="dash-table">
+        <thead>
+          <tr>
+            <th class="dash-rank">#</th>
+            <th>模型</th>
+            <th class="num">调用</th>
+            <th class="num">输入 Token</th>
+            <th class="num">输出 Token</th>
+            <th class="num">合计 Token</th>
+            <th>最近使用</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+/// Compact human formatting for large request counts.
+function formatCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString("en-US");
+}
+
+function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString("en-US");
+}
+
+function formatLatency(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)} s`;
+  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+function formatRelativeTime(unix: number): string {
+  if (!unix) return "—";
+  const diff = Math.floor(Date.now() / 1000) - unix;
+  if (diff < 5) return "刚刚";
+  if (diff < 60) return `${diff} 秒前`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  const date = new Date(unix * 1000);
+  return `${date.getMonth() + 1}-${date.getDate()} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
 }
 
 function renderProxy(): string {
@@ -1423,10 +1750,10 @@ function renderProxy(): string {
 
     <section class="card">
       <div class="card-head">
-        <div><h2>限流策略</h2><p>每个 Key 在指定窗口内允许的最大请求数，超过后自动切换到其他 Key。</p></div>
+        <div><h2>限流策略</h2><p>窗口长度与 NIM 默认配额。每个 Key 都可以在「API Keys」页面单独覆盖；OpenAI / Anthropic 兼容上游默认不限速，需要时同样可以在 Key 上手填。</p></div>
       </div>
       <div class="form-grid two">
-        <label class="field"><span>每 Key 限流 <em class="hint-inline">建议 40</em></span><input id="rateLimit" type="number" min="1" value="${config.rate_limit_per_key}" /></label>
+        <label class="field"><span>NIM 默认每 Key 限流 <em class="hint-inline">官方上限 40 / 分钟</em></span><input id="rateLimit" type="number" min="1" value="${config.rate_limit_per_key}" /></label>
         <label class="field"><span>窗口秒数 <em class="hint-inline">建议 60</em></span><input id="rateWindow" type="number" min="1" value="${config.rate_window_secs}" /></label>
       </div>
     </section>
@@ -1435,9 +1762,9 @@ function renderProxy(): string {
 
 function renderKeys(): string {
   if (!config) return "";
-  const { limit, window: rateWindow } = rateLimitOf();
+  const rateWindow = rateLimitWindow();
+  const nimDefault = config.rate_limit_per_key;
   const snapshots = proxyStatus?.keys ?? [];
-  const totalQuota = config.nim_api_keys.length * limit;
   // Per-provider count — gives the user a quick sanity check that
   // keys actually got tagged with the protocol they intended.
   const providerCounts = config.nim_api_keys.reduce<Record<ProviderKind, number>>(
@@ -1465,8 +1792,8 @@ function renderKeys(): string {
     <div class="banner">
       <div class="banner-icon">${ICONS.bolt}</div>
       <div class="banner-text">
-        <strong>每个 Key 独立限速 <span class="mono">${limit}</span> 次 / <span class="mono">${rateWindow}</span> 秒</strong>
-        <p>当前共配置 <strong>${config.nim_api_keys.length}</strong> 个 Key${providerSummary ? `（${providerSummary}）` : ""}，理论合并配额约 <strong>${totalQuota}</strong> 次/分钟。已过期、被上游禁用或冷却中的 Key 不参与轮询。</p>
+        <strong>分 Provider 限速：NIM 默认 <span class="mono">${nimDefault}</span> 次 / <span class="mono">${rateWindow}</span> 秒，OpenAI / Anthropic 兼容默认不限</strong>
+        <p>当前共配置 <strong>${config.nim_api_keys.length}</strong> 个 Key${providerSummary ? `（${providerSummary}）` : ""}。每个 Key 的「限流」字段可单独覆盖默认值，留空则按所属 provider 的默认策略走。已过期、被上游禁用或冷却中的 Key 不参与轮询。</p>
         <p class="banner-secure">${ICONS.shield}<span>Key 写入用户配置目录下独立的 <code>secrets.json</code>（仅当前用户可读，Unix 自动 chmod 600），不写入项目仓库，亦不上传任何远程服务。</span></p>
       </div>
     </div>
@@ -1541,6 +1868,10 @@ function renderSingleAddForm(): string {
           </div>
         </label>
       </div>
+      <label class="field">
+        <span>限流（次 / ${rateLimitWindow()} 秒）<em class="hint-inline">${escapeHtml(rateLimitPlaceholder(singleAdd.provider))}</em></span>
+        <input id="addRateLimit" type="number" min="0" inputmode="numeric" placeholder="${escapeHtml(rateLimitPlaceholder(singleAdd.provider))}" value="${escapeHtml(singleAdd.rateLimit)}" />
+      </label>
       <div class="form-actions">
         <button id="addCancel" class="btn-ghost" type="button">取消</button>
         <button id="addSubmit" class="btn-primary" type="button">添加</button>
@@ -1577,6 +1908,10 @@ function renderBatchAddForm(): string {
           </div>
         </label>
       </div>
+      <label class="field">
+        <span>共享限流（次 / ${rateLimitWindow()} 秒）<em class="hint-inline">${escapeHtml(rateLimitPlaceholder(batchAdd.provider))}</em></span>
+        <input id="batchRateLimit" type="number" min="0" inputmode="numeric" placeholder="${escapeHtml(rateLimitPlaceholder(batchAdd.provider))}" value="${escapeHtml(batchAdd.rateLimit)}" />
+      </label>
       <div class="form-actions">
         <button id="batchCancel" class="btn-ghost" type="button">取消</button>
         <button id="batchSubmit" class="btn-primary" type="button">导入</button>
@@ -1597,15 +1932,22 @@ function renderManagedKeys(snapshots: KeySnapshot[]): string {
 }
 
 function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | undefined): string {
-  if (editingKeyId === k.id) return renderEditCard(k);
-
   const masked = maskKey(k.value);
   const stateBadge = snap ? keyStateBadge(snap.state) : `<span class="badge badge-neutral">未运行</span>`;
   const stateNorm = snap ? normalizeState(snap.state) : "neutral";
   const expiry = formatExpiry(k.expires_at);
-  const { limit, window: rateWindow } = rateLimitOf();
+  const rateWindow = rateLimitWindow();
+  // Prefer the snapshot value (already resolved by the backend) so a
+  // user editing a key without restarting the proxy still sees the
+  // *previous* effective limit until they save; fall back to the
+  // unsaved config + provider default for cards that haven't reached
+  // the live pool yet.
+  const limit =
+    typeof snap?.rate_limit === "number" && snap.rate_limit > 0
+      ? snap.rate_limit
+      : effectiveRateLimitForKey(k);
   const recent = snap?.recent_requests ?? 0;
-  const ratio = limit > 0 ? Math.min(1, recent / limit) : 0;
+  const ratio = limit ? Math.min(1, recent / limit) : 0;
   const fillCls = ratio >= 0.9 ? "danger" : ratio >= 0.6 ? "warn" : "";
   const widthPct = (ratio * 100).toFixed(1);
   const provider = (k.provider ?? "nim") as ProviderKind;
@@ -1646,11 +1988,13 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
       <div class="usage-bar">
         <div class="usage-bar-head">
           <span>最近 ${rateWindow}s 用量</span>
-          <span class="usage-fraction">${recent} / ${limit}</span>
+          <span class="usage-fraction">${recent}${limit ? ` / ${limit}` : "（不限速）"}</span>
         </div>
-        <div class="usage-bar-track">
-          <div class="usage-bar-fill ${fillCls}" style="width:${widthPct}%"></div>
-        </div>
+        ${
+          limit
+            ? `<div class="usage-bar-track"><div class="usage-bar-fill ${fillCls}" style="width:${widthPct}%"></div></div>`
+            : ""
+        }
       </div>
       <dl class="key-meta">
         <div><dt>并发</dt><dd>${snap?.inflight ?? 0}</dd></div>
@@ -1660,17 +2004,57 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
   `;
 }
 
-function renderEditCard(k: NimApiKey): string {
-  const meta = PROVIDERS[editForm.provider];
+/// Mirror of the Rust-side `NimApiKey::effective_rate_limit` so the
+/// Keys page can render the right cap without waiting for the snapshot
+/// to round-trip through the proxy. Stays in sync with that helper —
+/// any change there should be reflected here.
+function effectiveRateLimitForKey(k: NimApiKey): number | null {
+  if (typeof k.rate_limit === "number" && k.rate_limit > 0) return k.rate_limit;
+  const provider = (k.provider ?? "nim") as ProviderKind;
+  if (provider === "nim") return config?.rate_limit_per_key ?? 40;
+  return null;
+}
+
+/// Modal overlay for editing a single API key. Returns `""` when no
+/// key is being edited; otherwise returns a `.modal-backdrop > .modal`
+/// fragment that the global `render()` appends to the page so the
+/// dialog floats above whichever view is active. The form keeps the
+/// same input IDs so existing field-binding code continues to work.
+function renderEditModal(): string {
+  if (editingKeyId === null || !config) return "";
+  const idx = config.nim_api_keys.findIndex((x) => x.id === editingKeyId);
+  if (idx < 0) return "";
+  const k = config.nim_api_keys[idx];
   return `
-    <div class="key-card managed editing">
-      <div class="key-card-head">
-        <strong>编辑 Key</strong>
-        <div class="key-actions">
-          <button id="editCancel" class="btn-ghost" type="button">取消</button>
-          <button id="editSave" class="btn-primary" type="button" data-edit-save="${escapeHtml(k.id)}">保存</button>
-        </div>
+    <div class="modal-backdrop" id="editBackdrop">
+      <div class="modal modal-wide" role="dialog" aria-labelledby="editModalTitle" aria-modal="true">
+        ${renderEditCardBody(k, idx)}
       </div>
+    </div>
+  `;
+}
+
+/// Form contents inside the edit modal. Kept as a separate function so
+/// the modal wrapper can stay small and the body can be inserted into
+/// other surfaces in the future without re-implementing the layout.
+function renderEditCardBody(k: NimApiKey, index: number): string {
+  const meta = PROVIDERS[editForm.provider];
+  let mappingHint: string;
+  if (editForm.modelsLoading) {
+    mappingHint = "正在拉取该 Key 的模型目录…";
+  } else if (editForm.modelsError) {
+    mappingHint = `下拉建议不可用：${editForm.modelsError}（仍可手动输入）`;
+  } else if (editForm.availableModels.length > 0) {
+    mappingHint = `已加载 ${editForm.availableModels.length} 个上游模型，输入时自动过滤。留空字段会沿用上方"模型映射"页的全局配置。`;
+  } else {
+    mappingHint = '尚未拉取到模型列表，可以直接手动输入；留空字段会沿用全局"模型映射"配置。';
+  }
+  return `
+    <header class="edit-modal-head">
+      <h3 id="editModalTitle">编辑 Key <span class="key-num">#${index + 1}</span></h3>
+      <button id="editClose" class="btn-icon" type="button" aria-label="关闭" title="关闭 (Esc)">×</button>
+    </header>
+    <div class="edit-modal-body">
       <label class="field">
         <span>端点类型</span>
         ${providerPicker("editProvider", editForm.provider)}
@@ -1694,18 +2078,49 @@ function renderEditCard(k: NimApiKey): string {
             <input id="editExpiry" type="datetime-local" ${editForm.expiresAt ? `value="${escapeHtml(editForm.expiresAt)}"` : ""} />
             <button id="editExpiryClear" class="btn-icon" type="button" aria-label="清除到期" title="清除">×</button>
           </div>
-</label>
-</div>
-<!-- Per-key model mapping -->
-<div class="form-grid two" style="margin-top:12px">
-  <label class="field"><span>默认模型</span><input id="editDefaultModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.defaultModel)}" /></label>
-  <label class="field"><span>Opus 模型</span><input id="editOpusModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.opusModel)}" /></label>
-  <label class="field"><span>Sonnet 模型</span><input id="editSonnetModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.sonnetModel)}" /></label>
-  <label class="field"><span>Haiku 模型</span><input id="editHaikuModel" placeholder="可选" value="${escapeHtml(editForm.modelMapping.haikuModel)}" /></label>
-</div>
-<p class="text-muted" style="margin-top:8px;font-size:12px">留空则使用全局默认配置。配置后该 Key 会使用自己的模型映射。</p>
-</div>
-`;
+        </label>
+      </div>
+      <label class="field">
+        <span>限流（次 / ${rateLimitWindow()} 秒）<em class="hint-inline">${escapeHtml(rateLimitPlaceholder(editForm.provider))}</em></span>
+        <input id="editRateLimit" type="number" min="0" inputmode="numeric" placeholder="${escapeHtml(rateLimitPlaceholder(editForm.provider))}" value="${escapeHtml(editForm.rateLimit)}" />
+      </label>
+      <div class="edit-mapping">
+        <div class="edit-mapping-head">
+          <span>该 Key 的模型映射 <em class="hint-inline">留空 → 沿用全局</em></span>
+          <button id="editMappingRefresh" type="button" class="btn-ghost btn-sm" ${editForm.modelsLoading ? "disabled" : ""}>${editForm.modelsLoading ? "刷新中…" : "重新拉取"}</button>
+        </div>
+        <p class="edit-mapping-hint">${escapeHtml(mappingHint)}</p>
+        <div class="form-grid two">
+          ${editMappingField("editDefaultModel", "默认", editForm.modelMapping.defaultModel, "默认走全局")}
+          ${editMappingField("editOpusModel", "Opus", editForm.modelMapping.opusModel, "走默认")}
+          ${editMappingField("editSonnetModel", "Sonnet", editForm.modelMapping.sonnetModel, "走默认")}
+          ${editMappingField("editHaikuModel", "Haiku", editForm.modelMapping.haikuModel, "走默认")}
+        </div>
+      </div>
+    </div>
+    <footer class="edit-modal-actions">
+      <button id="editCancel" class="btn-ghost" type="button">取消</button>
+      <button id="editSave" class="btn-primary" type="button" data-edit-save="${escapeHtml(k.id)}">保存</button>
+    </footer>
+  `;
+}
+
+/// One row in the "per-key model mapping" grid. Kept private to
+/// `renderEditCard` because the wiring (data-mapping-field, dropdown
+/// element shape) is only meaningful inside that card.
+function editMappingField(id: string, label: string, value: string, fallback: string): string {
+  return `
+    <label class="field">
+      <span>${escapeHtml(label)}</span>
+      <div class="model-combobox">
+        <input id="${id}" class="model-combobox-input" autocomplete="off"
+          placeholder="留空 → ${escapeHtml(fallback)}"
+          value="${escapeHtml(value)}"
+          data-mapping-field="${id}" />
+        <div class="model-combobox-dropdown" hidden></div>
+      </div>
+    </label>
+  `;
 }
 
 function combobox(id: string, value: string, placeholder: string): string {
@@ -2171,17 +2586,20 @@ function updateRuntimeUI() {
   }
   lastRenderedRunning = isRunning;
 
-  const keyList = document.getElementById("keyList");
-  if (!keyList) return;
   if (activeView === "dashboard") {
-    keyList.innerHTML = renderKeyList(proxyStatus.keys, 6);
+    // Patch just the dynamic dashboard sections in-place so the user's
+    // scroll position is preserved across the 3 s polling tick. The
+    // `<header>` controls (start / stop / 检查更新) are static given the
+    // running state we already short-circuited on above, so they don't
+    // need re-binding here.
+    refreshDashboardLiveSections();
     return;
   }
   if (activeView === "keys") {
-    // Skip live re-render while the user is mid-edit so we don't yank focus
-    // out of the inline form. The next save / cancel will trigger a full
-    // render() that picks up the fresh stats.
-    if (editingKeyId !== null) return;
+    const keyList = document.getElementById("keyList");
+    if (!keyList) return;
+    // The edit modal is rendered separately at the page root, so the
+    // live card refresh below leaves it untouched even mid-edit.
     keyList.innerHTML = renderManagedKeys(proxyStatus.keys);
     bindManagedKeyControls();
     bindCopyButtons();
@@ -2256,8 +2674,7 @@ function bind() {
   byId<HTMLButtonElement>("sidebarToggle")?.addEventListener("click", toggleSidebar);
   byId<HTMLButtonElement>("save")?.addEventListener("click", () => save());
   byId<HTMLButtonElement>("openClaude")?.addEventListener("click", openClaudeTerminal);
- byId<HTMLButtonElement>("openClaudeDesktop")?.addEventListener("click", openClaudeDesktopApp);
-  byId<HTMLButtonElement>("diagRefresh")?.addEventListener("click", refreshDiagnostic);
+  byId<HTMLButtonElement>("openClaudeDesktop")?.addEventListener("click", openClaudeDesktopApp);
   byId<HTMLButtonElement>("tokToggle")?.addEventListener("click", () => {
     showToken = !showToken;
     render();
@@ -2266,9 +2683,90 @@ function bind() {
   bindKeysPage();
   bindIdePage();
   bindUpdateUi();
+  bindEditModal();
 
   bindCopyButtons();
   setupComboboxes();
+  bindEditMappingComboboxes();
+}
+
+/// Per-edit-card mapping inputs. We can't reuse the global `combobox()`
+/// helper because the source list is per-key (`editForm.availableModels`)
+/// and changes whenever `refreshEditAvailableModels` lands. Each field
+/// also has to write through to `editForm.modelMapping` so it survives
+/// re-renders triggered by provider switches or model-fetch settles.
+function bindEditMappingComboboxes() {
+  const inputs = document.querySelectorAll<HTMLInputElement>(
+    "input.model-combobox-input[data-mapping-field]",
+  );
+  if (inputs.length === 0) return;
+  inputs.forEach((input) => {
+    const dropdown = input.parentElement?.querySelector<HTMLDivElement>(
+      ".model-combobox-dropdown",
+    );
+    if (!dropdown) return;
+
+    const writeBack = (value: string) => {
+      switch (input.id) {
+        case "editDefaultModel":
+          editForm.modelMapping.defaultModel = value;
+          break;
+        case "editOpusModel":
+          editForm.modelMapping.opusModel = value;
+          break;
+        case "editSonnetModel":
+          editForm.modelMapping.sonnetModel = value;
+          break;
+        case "editHaikuModel":
+          editForm.modelMapping.haikuModel = value;
+          break;
+      }
+    };
+
+    const renderDropdown = () => {
+      const query = input.value.trim().toLowerCase();
+      const source = editForm.availableModels;
+      const filtered = (
+        query ? source.filter((m) => m.toLowerCase().includes(query)) : source
+      ).slice(0, 30);
+      if (filtered.length === 0) {
+        dropdown.hidden = true;
+        dropdown.innerHTML = "";
+        return;
+      }
+      dropdown.innerHTML = filtered
+        .map(
+          (m) =>
+            `<div class="model-combobox-item" data-value="${escapeHtml(m)}" title="${escapeHtml(m)}">${escapeHtml(m)}</div>`,
+        )
+        .join("");
+      dropdown.hidden = false;
+    };
+
+    input.addEventListener("input", () => {
+      writeBack(input.value);
+      renderDropdown();
+    });
+    input.addEventListener("focus", renderDropdown);
+
+    dropdown.addEventListener("mousedown", (event) => {
+      const item = (event.target as HTMLElement).closest<HTMLDivElement>(
+        ".model-combobox-item",
+      );
+      if (!item) return;
+      event.preventDefault();
+      const value = item.dataset.value ?? "";
+      input.value = value;
+      writeBack(value);
+      dropdown.hidden = true;
+    });
+
+    input.addEventListener("blur", () => {
+      window.setTimeout(() => {
+        dropdown.hidden = true;
+      }, 150);
+    });
+  });
 }
 
 function bindIdePage() {
@@ -2316,6 +2814,9 @@ function bindKeysPage() {
     const input = byId<HTMLInputElement>("addExpiry");
     if (input) input.value = "";
   });
+  byId<HTMLInputElement>("addRateLimit")?.addEventListener("input", (e) => {
+    singleAdd.rateLimit = (e.target as HTMLInputElement).value;
+  });
   byId<HTMLButtonElement>("addToggle")?.addEventListener("click", () => {
     showToken = !showToken;
     render();
@@ -2341,6 +2842,9 @@ function bindKeysPage() {
     batchAdd.expiresAt = "";
     const input = byId<HTMLInputElement>("batchExpiry");
     if (input) input.value = "";
+  });
+  byId<HTMLInputElement>("batchRateLimit")?.addEventListener("input", (e) => {
+    batchAdd.rateLimit = (e.target as HTMLInputElement).value;
   });
   byId<HTMLButtonElement>("batchCancel")?.addEventListener("click", closeAddPanel);
   byId<HTMLButtonElement>("batchSubmit")?.addEventListener("click", () => {
@@ -2379,6 +2883,10 @@ function bindKeysPage() {
   bindManagedKeyControls();
 }
 
+/// Binds in-card buttons that live inside the keys grid (edit/delete
+/// triggers + the enable/disable toggle). Safe to re-run after a
+/// `keyList.innerHTML = ...` refresh because it only touches elements
+/// rendered by `renderManagedKeyCard` — not the modal.
 function bindManagedKeyControls() {
   document.querySelectorAll<HTMLButtonElement>("button[data-edit-id]").forEach((btn) => {
     btn.addEventListener("click", () => beginEditKey(btn.dataset.editId ?? ""));
@@ -2388,14 +2896,20 @@ function bindManagedKeyControls() {
       void deleteKey(btn.dataset.deleteId ?? "");
     });
   });
-  // Bind toggle switch for enabling/disabling keys
   document.querySelectorAll<HTMLInputElement>("input.key-enabled-toggle").forEach((toggle) => {
     toggle.addEventListener("change", async () => {
       const id = toggle.dataset.toggleId ?? "";
       await toggleKeyEnabled(id, toggle.checked);
     });
   });
+}
 
+/// Wires up the edit modal: form fields, header close button, footer
+/// Cancel/Save, backdrop click-to-dismiss, and Esc-to-dismiss. Called
+/// from `bind()` after every full render so the modal works regardless
+/// of the active view; relies on the elements only existing while
+/// `editingKeyId !== null`, otherwise the queries no-op.
+function bindEditModal() {
   const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T | null;
 
   byId<HTMLInputElement>("editValue")?.addEventListener("input", (e) => {
@@ -2415,15 +2929,47 @@ function bindManagedKeyControls() {
     const input = byId<HTMLInputElement>("editExpiry");
     if (input) input.value = "";
   });
+  byId<HTMLInputElement>("editRateLimit")?.addEventListener("input", (e) => {
+    editForm.rateLimit = (e.target as HTMLInputElement).value;
+  });
   byId<HTMLButtonElement>("editToggle")?.addEventListener("click", () => {
     showToken = !showToken;
     render();
   });
   byId<HTMLButtonElement>("editCancel")?.addEventListener("click", cancelEdit);
+  byId<HTMLButtonElement>("editClose")?.addEventListener("click", cancelEdit);
   byId<HTMLButtonElement>("editSave")?.addEventListener("click", (e) => {
     const id = (e.currentTarget as HTMLButtonElement).dataset.editSave ?? "";
     void submitEditKey(id);
   });
+  byId<HTMLButtonElement>("editMappingRefresh")?.addEventListener("click", () => {
+    if (!editingKeyId) return;
+    void refreshEditAvailableModels(editingKeyId);
+  });
+
+  // Click outside the dialog (on the backdrop itself) closes the modal.
+  byId<HTMLDivElement>("editBackdrop")?.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) cancelEdit();
+  });
+
+  // Esc-to-dismiss. We swap out any prior listener first so repeated
+  // re-renders during the edit session don't pile handlers up; the
+  // listener also no-ops once the modal has been closed via another
+  // path (Cancel / Save / backdrop).
+  if (editModalEscHandler) {
+    document.removeEventListener("keydown", editModalEscHandler, true);
+    editModalEscHandler = null;
+  }
+  if (editingKeyId !== null) {
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && editingKeyId !== null) {
+        ev.preventDefault();
+        cancelEdit();
+      }
+    };
+    editModalEscHandler = onKey;
+    document.addEventListener("keydown", onKey, true);
+  }
 }
 
 load();

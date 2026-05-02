@@ -2770,6 +2770,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "nim-client",
+ "parking_lot",
  "proxy-core",
  "serde",
  "serde_json",

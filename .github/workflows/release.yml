@@ -167,52 +167,7 @@ jobs:
             1. 打开终端
             2. 输入以下命令：
               ```bash
-              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
-              ```
-            3. 输入密码后回车
-            4. 双击应用即可正常运行
-
-            或者：右键应用 → 打开 → 点击"打开"按钮。
-            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
-
-            **首次运行提示"文件损坏"怎么办？**
-
-            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
-
-            1. 打开终端
-            2. 输入以下命令：
-              ```bash
-              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
-              ```
-            3. 输入密码后回车
-            4. 双击应用即可正常运行
-
-            或者：右键应用 → 打开 → 点击"打开"按钮。
-            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
-
-            **首次运行提示"文件损坏"怎么办？**
-
-            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
-
-            1. 打开终端
-            2. 输入以下命令：
-              ```bash
-              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
-              ```
-            3. 输入密码后回车
-            4. 双击应用即可正常运行
-
-            或者：右键应用 → 打开 → 点击"打开"按钮。
-            macOS 下载 `CCNim_*_aarch64.dmg`（Apple Silicon）或 `CCNim_*_x86_64.dmg`（Intel Mac）。
-
-            **首次运行提示"文件损坏"怎么办？**
-
-            由于应用未签名，macOS Gatekeeper 会拦截。按以下步骤操作：
-
-            1. 打开终端
-            2. 输入以下命令：
-              ```bash
-              sudo xattr -rd com.quarantine.data /Applications/CCNim.app
+              sudo xattr -cr /Applications/CCNim.app
               ```
             3. 输入密码后回车
             4. 双击应用即可正常运行
