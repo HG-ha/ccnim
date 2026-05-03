@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./style.css";
@@ -64,6 +63,10 @@ type KeySnapshot = {
   inflight: number;
   recent_requests: number;
   failure_count: number;
+  /// Seconds remaining until the active cooldown lifts. Only present
+  /// when `state === "cooling_down"`; lets the dashboard render an
+  /// "auto-recover in 4m32s" hint without doing wall-clock math itself.
+  cooldown_remaining_secs?: number | null;
   /// Effective rate-limit cap resolved by the backend (per-key
   /// override or provider default). `null` means "no local cap" —
   /// the GUI renders this as "不限" instead of `recent / 0`.
@@ -188,9 +191,6 @@ type IdeApplyReport = {
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const toastEl = document.querySelector<HTMLDivElement>("#toast")!;
-const tbStatus = document.querySelector<HTMLDivElement>("#tbStatus")!;
-const tbStatusText = tbStatus.querySelector<HTMLSpanElement>(".tb-status-text")!;
-const tbStatusUrl = tbStatus.querySelector<HTMLSpanElement>(".tb-status-url")!;
 
 let config: AppConfig | null = null;
 let proxyStatus: ProxyStatus | null = null;
@@ -274,8 +274,6 @@ const editForm = {
   /// "inherit the provider default"; a positive integer overrides it.
   rateLimit: "",
 };
-
-const appWindow = getCurrentWindow();
 
 /// Updater state machine. The update plugin returns an `Update` handle
 /// once a newer release is detected; we keep that handle around so the
@@ -449,10 +447,13 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-function setupTitlebar() {
-  document.getElementById("winMin")?.addEventListener("click", () => appWindow.minimize());
-  document.getElementById("winMax")?.addEventListener("click", () => appWindow.toggleMaximize());
-  document.getElementById("winClose")?.addEventListener("click", () => appWindow.close());
+/// Tag the document with the host platform so any future per-platform
+/// CSS tweaks have a hook. We no longer ship a custom titlebar —
+/// every platform uses the system window chrome — so this is purely a
+/// forward-looking selector and not load-bearing today.
+function setupPlatformTag() {
+  const platform = /Mac|iPhone|iPad/.test(navigator.userAgent) ? "macos" : "other";
+  document.documentElement.dataset.platform = platform;
 }
 
 function toggleSidebar() {
@@ -466,28 +467,40 @@ function toggleSidebar() {
   render();
 }
 
-function syncTitlebarStatus() {
+/// Refresh the small running-state pill embedded in the sidebar
+/// header. Replaced the old custom-titlebar pill when we switched to
+/// native window chrome — we re-render it on every status tick so the
+/// indicator follows the proxy state without a full DOM rebuild. The
+/// pill is rendered by `renderSidebarStatus()` and may be absent on
+/// the first paint (before the sidebar mounts), so all queries are
+/// null-safe.
+function syncStatusPill() {
+  const pill = document.getElementById("sbStatus");
+  if (!pill) return;
+  const text = pill.querySelector<HTMLSpanElement>(".sb-status-text");
+  const url = pill.querySelector<HTMLSpanElement>(".sb-status-url");
   const running = proxyStatus?.running ?? false;
-  const url = proxyStatus?.listen_url ?? "";
-  tbStatus.classList.toggle("online", running);
-  tbStatus.classList.toggle("offline", !running);
-  tbStatus.classList.toggle("has-url", running && !!url);
-  tbStatusText.textContent = running ? "运行中" : "未启动";
-  tbStatusUrl.textContent = running && url ? url : "";
+  const listenUrl = proxyStatus?.listen_url ?? "";
+  pill.classList.toggle("online", running);
+  pill.classList.toggle("offline", !running);
+  pill.classList.toggle("has-url", running && !!listenUrl);
+  if (text) text.textContent = running ? "运行中" : "未启动";
+  if (url) url.textContent = running && listenUrl ? listenUrl : "";
 }
 
 async function load() {
-  setupTitlebar();
+  setupPlatformTag();
+  installResetKeyDelegate();
   try {
     config = await invoke<AppConfig>("load_config");
     await loadAppVersion();
     await refreshStatus();
-    syncTitlebarStatus();
     render();
+    syncStatusPill();
     if (statusTimer) window.clearInterval(statusTimer);
     statusTimer = window.setInterval(async () => {
       await refreshStatus();
-      syncTitlebarStatus();
+      syncStatusPill();
       updateRuntimeUI();
     }, 3000);
     // Pull the model catalog once on startup, then every 30 min. When the
@@ -539,8 +552,8 @@ async function startProxy() {
     toast(`启动失败: ${error}`, "error");
   }
   await refreshStatus();
-  syncTitlebarStatus();
   render();
+  syncStatusPill();
 }
 
 async function stopProxy() {
@@ -551,8 +564,8 @@ async function stopProxy() {
     toast(`停止失败: ${error}`, "error");
   }
   await refreshStatus();
-  syncTitlebarStatus();
   render();
+  syncStatusPill();
 }
 
 /// Silent background refresh of the upstream model list. Skips the call
@@ -1075,6 +1088,78 @@ function keyStateBadge(state: string): string {
   return `<span class="badge ${item.cls}">${item.label}</span>`;
 }
 
+/// Pretty-print the seconds remaining in a cooldown as "Xm Ys" /
+/// "Xs". We don't try to be clever about hours — the longest soft
+/// cooldown the backend ever emits is 30 minutes, anything past that
+/// has been promoted to `Disabled`.
+function formatCooldown(secs: number): string {
+  if (secs <= 0) return "即将恢复";
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  if (m === 0) return `${s}s`;
+  if (s === 0) return `${m}m`;
+  return `${m}m ${s}s`;
+}
+
+/// Optional inline status row appended under a key's mask: shows the
+/// auto-recover countdown for `cooling_down` keys and a manual reset
+/// button for both `cooling_down` and `disabled`. Returns `""` for
+/// healthy / expired keys so the layout collapses cleanly.
+function renderKeyStatusActions(snap: KeySnapshot): string {
+  const norm = normalizeState(snap.state);
+  if (norm !== "cooling_down" && norm !== "disabled") return "";
+  const stableId = snap.stable_id ?? "";
+  if (!stableId) return "";
+  const cooldown = snap.cooldown_remaining_secs;
+  const hint =
+    norm === "cooling_down" && typeof cooldown === "number" && cooldown > 0
+      ? `<span class="dash-status-hint">自动恢复约 ${escapeHtml(formatCooldown(cooldown))}</span>`
+      : norm === "disabled"
+        ? `<span class="dash-status-hint">连续认证失败已禁用</span>`
+        : "";
+  return `
+    <div class="dash-status-actions">
+      ${hint}
+      <button class="btn-ghost btn-sm" type="button" data-reset-id="${escapeHtml(stableId)}" title="清除冷却 / 禁用，给该 Key 一次重试机会">重置状态</button>
+    </div>
+  `;
+}
+
+/// Tauri `reset_key` invocation. The backend pops the soft-cooldown /
+/// Disabled flag and returns whether a matching key was found; we
+/// surface that as a toast so the user knows the click had effect.
+async function resetKeyById(stableId: string) {
+  if (!stableId) return;
+  try {
+    const ok = await invoke<boolean>("reset_key", { stableId });
+    if (ok) {
+      toast("已重置状态，下次请求将再次尝试", "success");
+      void refreshStatus();
+    } else {
+      toast("代理未运行或未找到对应 Key", "error");
+    }
+  } catch (err) {
+    toast(`重置失败：${err}`, "error");
+  }
+}
+
+/// Document-level click delegate for `data-reset-id` buttons. We
+/// install it once at boot rather than re-binding inside per-render
+/// helpers because the buttons live in two surfaces (dashboard table,
+/// keys page card) that each have their own refresh cycle, and
+/// per-render binding is what causes the duplicate-handler bugs we
+/// already saw with the edit modal.
+function installResetKeyDelegate() {
+  document.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    const btn = target.closest("button[data-reset-id]") as HTMLButtonElement | null;
+    if (!btn) return;
+    ev.preventDefault();
+    void resetKeyById(btn.dataset.resetId ?? "");
+  });
+}
+
 function newId(): string {
   // crypto.randomUUID is available in modern WebView2/WKWebView; fall back
   // to a math-based id for older runtimes so we never silently emit "".
@@ -1196,6 +1281,11 @@ function render() {
             <div class="brand-subtitle">Claude Code · NVIDIA NIM 桌面代理</div>
           </div>
         </div>
+        <div id="sbStatus" class="sb-status offline" title="代理状态">
+          <span class="sb-status-dot"></span>
+          <span class="sb-status-text">未启动</span>
+          <span class="sb-status-url"></span>
+        </div>
         <nav class="nav">
           <div class="nav-section">导航</div>
           ${[
@@ -1228,6 +1318,10 @@ function render() {
   `;
 
   bind();
+  // The sidebar status pill is part of the just-rebuilt DOM; refresh
+  // it immediately so the indicator doesn't flash "未启动" for a tick
+  // before the next status poll comes back.
+  syncStatusPill();
 }
 
 function renderView(): string {
@@ -1565,6 +1659,7 @@ function renderDashboardKeyTable(
               ${keyStateBadge(k.state)}
             </div>
             ${labelCell}
+            ${renderKeyStatusActions(k)}
           </td>
           <td>
             <div class="dash-usage">${usageCell}
@@ -2000,6 +2095,7 @@ function renderManagedKeyCard(k: NimApiKey, index: number, snap: KeySnapshot | u
         <div><dt>并发</dt><dd>${snap?.inflight ?? 0}</dd></div>
         <div><dt>失败</dt><dd class="${(snap?.failure_count ?? 0) > 0 ? "fail" : ""}">${snap?.failure_count ?? 0}</dd></div>
       </dl>
+      ${snap ? renderKeyStatusActions(snap) : ""}
     </div>
   `;
 }

@@ -315,6 +315,15 @@ fn handle_status_with_retry(
             lease.pool().mark_rate_limited(lease.key_id(), retry_after);
             Err(NimClientError::RateLimited)
         }
+        // Upstream 5xx is overwhelmingly *not* a key problem (provider
+        // outage, bad gateway, edge timeout). Feed it into the same
+        // sliding-window network-error counter we use for transport
+        // failures so a single hiccup is harmless but a sustained
+        // outage backs the key off without permanently marking it bad.
+        other if other.is_server_error() => {
+            lease.pool().mark_network_error(lease.key_id());
+            Err(NimClientError::Request(format!("HTTP {other}")))
+        }
         other => Err(NimClientError::Request(format!("HTTP {other}"))),
     }
 }

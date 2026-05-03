@@ -6,37 +6,6 @@
     <title>CCNim</title>
   </head>
   <body>
-    <header id="titlebar" data-tauri-drag-region>
-      <div class="tb-left" data-tauri-drag-region>
-        <div class="tb-mark" data-tauri-drag-region>CC</div>
-        <span class="tb-title" data-tauri-drag-region>CCNim</span>
-        <span class="tb-tag" data-tauri-drag-region>NVIDIA NIM</span>
-      </div>
-      <div class="tb-center" data-tauri-drag-region>
-        <div id="tbStatus" class="tb-status offline" title="代理状态">
-          <span class="tb-status-dot"></span>
-          <span class="tb-status-text">未启动</span>
-          <span class="tb-status-url"></span>
-        </div>
-      </div>
-      <div class="tb-controls">
-        <button id="winMin" class="tb-btn" aria-label="最小化" title="最小化">
-          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-            <rect x="2" y="5.5" width="8" height="1" fill="currentColor" />
-          </svg>
-        </button>
-        <button id="winMax" class="tb-btn" aria-label="最大化" title="最大化">
-          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-            <rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" />
-          </svg>
-        </button>
-        <button id="winClose" class="tb-btn close" aria-label="关闭" title="关闭">
-          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-            <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-          </svg>
-        </button>
-      </div>
-    </header>
     <main id="app"></main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/src/main.ts"></script>

@@ -112,6 +112,20 @@ fn proxy_status(state: State<'_, AppState>) -> Result<ProxyStatus, String> {
     })
 }
 
+/// Manually clear the soft-cooldown / Disabled state on a single key.
+/// Triggered by the dashboard "重置状态" button so the user can give
+/// a flapping key another chance without restarting the proxy. Only
+/// meaningful while the proxy is running — when stopped the pool
+/// itself is gone and there's nothing to reset, so we just no-op.
+#[tauri::command]
+fn reset_key(stable_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let guard = state.server.lock().map_err(|_| "server lock poisoned")?;
+    Ok(match guard.as_ref() {
+        Some(server) => server.key_pool().reset(&stable_id),
+        None => false,
+    })
+}
+
 #[tauri::command]
 fn scan_ides() -> Vec<IdeProfile> {
     ide_scan::scan_ides()
@@ -513,6 +527,7 @@ fn main() {
             scan_ides,
             apply_ide_settings,
             app_version,
+            reset_key,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

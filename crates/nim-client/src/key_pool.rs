@@ -98,7 +98,16 @@ pub struct KeySnapshot {
     pub state: KeyState,
     pub inflight: usize,
     pub recent_requests: usize,
+    /// Number of failures still inside the rate window. Combined with
+    /// `cooldown_remaining_secs` this lets the dashboard explain *why*
+    /// a key is currently dormant without exposing the raw `Instant`.
     pub failure_count: usize,
+    /// Seconds until the active cooldown lifts (only meaningful when
+    /// `state == CoolingDown`). `None` means "no active cooldown".
+    /// Surfaced so the frontend can render a "auto-recovers in 4m32s"
+    /// hint and decide whether to show a manual reset button.
+    #[serde(default)]
+    pub cooldown_remaining_secs: Option<u64>,
     /// Whether this key is enabled.
     pub enabled: bool,
     /// Effective rate limit (requests per the pool-wide window) for
@@ -121,10 +130,32 @@ struct KeyEntry {
     inflight: usize,
     recent_requests: VecDeque<Instant>,
     cooldown_until: Option<Instant>,
-    failure_count: usize,
+    /// Sliding window of recent failure timestamps (any kind: auth /
+    /// rate-limit / 5xx / network). Pruned by `prune_failures` against
+    /// the pool-wide `rate_window`. A successful request clears the
+    /// window so transient hiccups don't accumulate forever.
+    failures: VecDeque<Instant>,
+    /// Sticky counter of *consecutive* auth failures (401/403). Cleared
+    /// only by a successful request or an explicit `reset()`. Used to
+    /// escalate from a soft-cooldown to a permanent `Disabled` after
+    /// repeated upstream rejections — a single 401 might be a CDN
+    /// hiccup, three in a row almost certainly isn't.
+    auth_failure_count: usize,
     enabled: bool,
     rate_limit: Option<usize>,
 }
+
+/// How many consecutive auth failures push a key from soft-cooldown
+/// into the sticky `Disabled` state. Three is enough to filter out
+/// CDN/edge flapping while still catching genuinely revoked keys
+/// before too many user-visible failures stack up.
+const AUTH_HARD_FAIL_THRESHOLD: usize = 3;
+
+/// How many failures inside the rate window before a network-level
+/// error (connect refused, timeout, 5xx) trips the cooldown. Tuned
+/// against the same window used for rate-limit pruning so the
+/// "recently seen" semantics are consistent across surfaces.
+const NETWORK_FAIL_THRESHOLD: usize = 3;
 
 impl KeyEntry {
     fn fresh(id: usize, entry: KeyPoolEntry) -> Self {
@@ -140,7 +171,8 @@ impl KeyEntry {
             inflight: 0,
             recent_requests: VecDeque::new(),
             cooldown_until: None,
-            failure_count: 0,
+            failures: VecDeque::new(),
+            auth_failure_count: 0,
             enabled: entry.enabled,
             rate_limit: entry.rate_limit,
         }
@@ -163,7 +195,8 @@ impl KeyEntry {
             inflight: prev.inflight,
             recent_requests: prev.recent_requests.clone(),
             cooldown_until: prev.cooldown_until,
-            failure_count: prev.failure_count,
+            failures: prev.failures.clone(),
+            auth_failure_count: prev.auth_failure_count,
             enabled: entry.enabled,
             rate_limit: entry.rate_limit,
         }
@@ -235,6 +268,7 @@ impl KeyPool {
         for entry in entries.iter_mut() {
             refresh_key_state(entry, now, now_unix);
             prune_requests(entry, now, self.rate_window);
+            prune_failures(entry, now, self.rate_window);
         }
 
         let candidate = entries
@@ -268,44 +302,106 @@ impl KeyPool {
     pub fn mark_success(&self, key_id: usize) {
         let mut entries = self.inner.lock();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == key_id) {
-            entry.failure_count = 0;
+            // A working request is the strongest possible "this key is
+            // fine" signal: drop the failure window and the auth-fail
+            // streak so transient hiccups don't accumulate forever.
+            entry.failures.clear();
+            entry.auth_failure_count = 0;
             // Keep terminal states sticky; only "transient unhealthy" gets reset.
             if matches!(entry.state, KeyState::CoolingDown) {
                 entry.state = KeyState::Healthy;
+                entry.cooldown_until = None;
             }
         }
     }
 
+    /// Record an auth (401/403) rejection from the upstream. Instead of
+    /// burning the key on the first 401 — which is hostile to CDN /
+    /// edge flapping and to the user editing a key while a request is
+    /// in flight — we soft-cool with exponential backoff and only
+    /// promote to the sticky `Disabled` state after
+    /// [`AUTH_HARD_FAIL_THRESHOLD`] consecutive auth failures. A
+    /// successful request on the same key in between resets the
+    /// streak.
     pub fn mark_auth_failed(&self, key_id: usize) {
         let mut entries = self.inner.lock();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == key_id) {
-            entry.state = KeyState::Disabled;
-            entry.failure_count += 1;
+            entry.failures.push_back(Instant::now());
+            entry.auth_failure_count += 1;
+            if entry.auth_failure_count >= AUTH_HARD_FAIL_THRESHOLD {
+                entry.state = KeyState::Disabled;
+                entry.cooldown_until = None;
+            } else {
+                entry.state = KeyState::CoolingDown;
+                // 5min, 10min — capped at 30min. Doubles the wait each
+                // attempt so a genuinely revoked key escalates to
+                // Disabled within ~15min total instead of repeatedly
+                // poking the upstream every few seconds.
+                let backoff_minutes = 5_u64.saturating_mul(1_u64 << (entry.auth_failure_count - 1));
+                let backoff = Duration::from_secs(backoff_minutes.min(30) * 60);
+                entry.cooldown_until = Some(Instant::now() + backoff);
+            }
         }
     }
 
     pub fn mark_rate_limited(&self, key_id: usize, retry_after: Option<Duration>) {
         let mut entries = self.inner.lock();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == key_id) {
+            entry.failures.push_back(Instant::now());
             entry.state = KeyState::CoolingDown;
-            entry.failure_count += 1;
-            entry.cooldown_until = Some(
-                Instant::now()
-                    + retry_after
-                        .unwrap_or_else(|| Duration::from_secs(10 * entry.failure_count as u64)),
-            );
+            // Honour an explicit Retry-After when we got one; otherwise
+            // back off proportional to the failure window so spammy
+            // upstreams are punished without permanently blacklisting
+            // the key.
+            let fallback =
+                Duration::from_secs(10_u64.saturating_mul(entry.failures.len() as u64).max(10));
+            entry.cooldown_until = Some(Instant::now() + retry_after.unwrap_or(fallback));
         }
     }
 
+    /// Record a transport-level error (TCP refused, DNS, timeout) or
+    /// an upstream 5xx. We treat both as "the key probably isn't the
+    /// problem" — so the cooldown only kicks in when several happen
+    /// inside the rate window, sliding away as the window passes.
     pub fn mark_network_error(&self, key_id: usize) {
+        let now = Instant::now();
         let mut entries = self.inner.lock();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == key_id) {
-            entry.failure_count += 1;
-            if entry.failure_count >= 3 {
+            entry.failures.push_back(now);
+            // Prune in-place so the threshold check sees the actual
+            // window count, not a count inflated by stale failures
+            // we'd drop on the next acquire anyway.
+            prune_failures(entry, now, self.rate_window);
+            if entry.failures.len() >= NETWORK_FAIL_THRESHOLD {
                 entry.state = KeyState::CoolingDown;
-                entry.cooldown_until = Some(Instant::now() + Duration::from_secs(30));
+                entry.cooldown_until = Some(now + Duration::from_secs(30));
             }
         }
+    }
+
+    /// Clear all transient unhealthy state for the key matching
+    /// `stable_id` (the GUI sends `NimApiKey.id`). Returns `true` if a
+    /// matching key was found. Always rolls a `Disabled` or
+    /// `CoolingDown` key back to `Healthy`; `Expired` is left alone
+    /// because that reflects a hard configuration fact (the user must
+    /// extend the expiry). Used by the dashboard's "重置状态" button
+    /// so the user can give a flapping key another chance without
+    /// restarting the proxy.
+    pub fn reset(&self, stable_id: &str) -> bool {
+        let mut entries = self.inner.lock();
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.stable_id == stable_id)
+        else {
+            return false;
+        };
+        entry.failures.clear();
+        entry.auth_failure_count = 0;
+        entry.cooldown_until = None;
+        if matches!(entry.state, KeyState::Disabled | KeyState::CoolingDown) {
+            entry.state = KeyState::Healthy;
+        }
+        true
     }
 
     pub fn release(&self, key_id: usize) {
@@ -324,6 +420,12 @@ impl KeyPool {
             .map(|entry| {
                 refresh_key_state(entry, now, now_unix);
                 prune_requests(entry, now, self.rate_window);
+                prune_failures(entry, now, self.rate_window);
+                let cooldown_remaining_secs = entry.cooldown_until.and_then(|until| {
+                    until
+                        .checked_duration_since(now)
+                        .map(|d| d.as_secs().max(1))
+                });
                 KeySnapshot {
                     id: entry.id,
                     stable_id: entry.stable_id.clone(),
@@ -335,7 +437,8 @@ impl KeyPool {
                     state: entry.state,
                     inflight: entry.inflight,
                     recent_requests: entry.recent_requests.len(),
-                    failure_count: entry.failure_count,
+                    failure_count: entry.failures.len(),
+                    cooldown_remaining_secs,
                     enabled: entry.enabled,
                     rate_limit: entry.rate_limit,
                 }
@@ -447,6 +550,19 @@ fn prune_requests(entry: &mut KeyEntry, now: Instant, window: Duration) {
     }
 }
 
+/// Slide the failure counter the same way as `prune_requests` slides
+/// the request counter, so a key that flapped 5 minutes ago doesn't
+/// count against it forever.
+fn prune_failures(entry: &mut KeyEntry, now: Instant, window: Duration) {
+    while entry
+        .failures
+        .front()
+        .is_some_and(|instant| now.duration_since(*instant) > window)
+    {
+        entry.failures.pop_front();
+    }
+}
+
 fn mask_key(key: &str) -> String {
     if key.len() <= 10 {
         return "********".to_string();
@@ -490,16 +606,99 @@ mod tests {
         assert_ne!(next.key_id(), first_id);
     }
 
+    /// A single 401/403 puts the key into a soft cooldown — not the
+    /// permanent `Disabled` state — so transient CDN flapping or a
+    /// race against the user editing the key doesn't permanently
+    /// take it offline. Repeat failures escalate to `Disabled`.
     #[test]
-    fn disables_key_on_auth_failure() {
+    fn auth_failure_is_soft_cooldown_then_hard_disable() {
         let pool = pool(&["nvapi-first"]);
         let lease = pool.acquire().expect("key");
         let id = lease.key_id();
         drop(lease);
 
         pool.mark_auth_failed(id);
-        assert!(pool.acquire().is_none());
+        let snap = &pool.snapshots()[0];
+        assert_eq!(snap.state, KeyState::CoolingDown);
+        assert!(snap.cooldown_remaining_secs.unwrap_or(0) > 0);
+        assert!(pool.acquire().is_none(), "cooled-down key is unavailable");
+
+        pool.mark_auth_failed(id);
+        assert_eq!(pool.snapshots()[0].state, KeyState::CoolingDown);
+
+        pool.mark_auth_failed(id);
         assert_eq!(pool.snapshots()[0].state, KeyState::Disabled);
+        assert!(pool.acquire().is_none());
+    }
+
+    /// A successful call between auth failures must reset the streak
+    /// — otherwise the third unrelated 401 in a long-running session
+    /// would still hard-disable the key.
+    #[test]
+    fn success_clears_auth_failure_streak() {
+        let pool = pool(&["nvapi-first"]);
+        let id = pool.acquire().unwrap().key_id();
+
+        pool.mark_auth_failed(id);
+        pool.mark_auth_failed(id);
+        pool.mark_success(id);
+
+        // Two more auth failures still shouldn't hit the threshold
+        // because the streak was reset by the success.
+        pool.mark_auth_failed(id);
+        pool.mark_auth_failed(id);
+        assert_eq!(pool.snapshots()[0].state, KeyState::CoolingDown);
+        assert_ne!(pool.snapshots()[0].state, KeyState::Disabled);
+    }
+
+    /// Network errors slide off the failure window — three failures
+    /// inside the window trips the cooldown, but a single one earlier
+    /// alone never should. Verifies we count window membership, not
+    /// a global accumulator.
+    #[test]
+    fn network_errors_trip_cooldown_only_after_threshold() {
+        let pool = pool(&["nvapi-first"]);
+        let id = pool.acquire().unwrap().key_id();
+
+        pool.mark_network_error(id);
+        assert_eq!(pool.snapshots()[0].state, KeyState::Healthy);
+        pool.mark_network_error(id);
+        assert_eq!(pool.snapshots()[0].state, KeyState::Healthy);
+        pool.mark_network_error(id);
+        assert_eq!(pool.snapshots()[0].state, KeyState::CoolingDown);
+    }
+
+    /// `reset(stable_id)` clears all transient unhealthy state and
+    /// pulls a Disabled / CoolingDown key back to Healthy without
+    /// touching Expired (which is a configuration fact, not a runtime
+    /// flapping signal).
+    #[test]
+    fn reset_revives_disabled_and_cooling_keys() {
+        let pool = KeyPool::new(
+            vec![KeyPoolEntry {
+                stable_id: "stable-A".into(),
+                value: "nvapi-first".into(),
+                rate_limit: Some(40),
+                ..Default::default()
+            }],
+            Duration::from_secs(60),
+        );
+        let id = pool.acquire().unwrap().key_id();
+
+        // Drive into Disabled via the soft-cooldown path.
+        for _ in 0..AUTH_HARD_FAIL_THRESHOLD {
+            pool.mark_auth_failed(id);
+        }
+        assert_eq!(pool.snapshots()[0].state, KeyState::Disabled);
+
+        assert!(pool.reset("stable-A"));
+        let snap = &pool.snapshots()[0];
+        assert_eq!(snap.state, KeyState::Healthy);
+        assert_eq!(snap.failure_count, 0);
+        assert!(snap.cooldown_remaining_secs.is_none());
+        assert!(pool.acquire().is_some(), "reset key must be acquirable");
+
+        assert!(!pool.reset("does-not-exist"));
     }
 
     /// The frontend matches on `state === "healthy"` etc. — keep the wire
