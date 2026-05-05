@@ -7,6 +7,13 @@
   </head>
   <body>
     <main id="app"></main>
+    <!--
+      Mount point for the "edit key" modal. Lives outside #app so that
+      a full render() (triggered by sidebar nav, status polls, page
+      switches, etc.) doesn't wipe / re-animate the modal mid-edit.
+      Managed exclusively by renderEditModalRoot() in src/main.ts.
+    -->
+    <div id="editModalRoot" aria-hidden="true"></div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

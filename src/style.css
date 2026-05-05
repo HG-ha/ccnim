@@ -204,13 +204,22 @@ a:hover {
 }
 
 /* Collapsed sidebar: shrink the pill to a centered dot so it doesn't
-   try to render text in 60px of horizontal space. */
+   try to render text in 60px of horizontal space. Use grid centering
+   (rather than flex + justify-content) because grid ignores the
+   `gap` of the parent when only one child is visible — flex still
+   reserves the gap edge in some engines, which used to nudge the
+   dot a pixel or two off-center. Border-radius is bumped to a
+   perfect circle so the 28×28 indicator reads as a status dot
+   rather than a tiny rounded button. */
 .app-shell.sidebar-collapsed .sb-status {
   margin: 0 auto 14px;
-  padding: 6px;
+  padding: 0;
   width: 28px;
   height: 28px;
-  justify-content: center;
+  display: grid;
+  place-items: center;
+  gap: 0;
+  border-radius: 50%;
 }
 
 .app-shell.sidebar-collapsed .sb-status .sb-status-text,
@@ -278,9 +287,20 @@ a:hover {
   padding: 6px 8px 18px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 12px;
+  /* Constrains the flex line so a long subtitle can't push the
+     mark or balloon the layout; the mark is `flex-shrink: 0` and
+     the text wrapper opts into shrinking with `min-width: 0`. */
+  min-width: 0;
 }
 
 .brand-mark {
+  /* Square badge — pin both axes and forbid flex shrinking so a
+     long sibling (`.brand-text`) can't squeeze it into a thin
+     rectangle. Without `flex-shrink: 0` the default value of 1
+     would let the gradient square deform whenever the subtitle
+     occupies more than its content-box width, which is exactly
+     the bug users hit at the 232 px expanded sidebar size. */
+  flex: 0 0 36px;
   width: 36px;
   height: 36px;
   border-radius: 10px;
@@ -291,6 +311,16 @@ a:hover {
   font-weight: 800;
   letter-spacing: 0.02em;
   box-shadow: 0 4px 12px rgba(37, 99, 235, 0.28);
+}
+
+.brand-text {
+  /* `min-width: 0` lets the inner text wrap / truncate instead of
+     expanding the flex line and squeezing `.brand-mark`. The
+     `overflow: hidden` makes the ellipsis on `.brand-subtitle`
+     actually take effect when the sidebar is at its narrowest
+     expanded width. */
+  min-width: 0;
+  overflow: hidden;
 }
 
 .brand-title {
@@ -304,6 +334,13 @@ a:hover {
   color: var(--text-dim);
   margin-top: 2px;
   letter-spacing: 0.02em;
+  /* Defensive truncation — the subtitle is long ("Claude Code ·
+     NVIDIA NIM 桌面代理") and at the sidebar's expanded 232 px
+     width it sits a hair away from overflow. Truncate with an
+     ellipsis if it ever does, instead of pushing the badge. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .nav {
@@ -1358,7 +1395,12 @@ textarea {
   grid-column: 1 / -1;
 }
 
-/* Edit-key modal */
+/* Edit-key modal
+   --------------
+   Anatomy: header (sticky, slight gradient) + scrollable body +
+   sticky footer with the primary action. Fixed inside `modal-wide`
+   so the dialog never overflows the viewport even on small screens.
+*/
 .modal.modal-wide {
   width: min(640px, 94vw);
   max-height: min(86vh, 760px);
@@ -1366,6 +1408,10 @@ textarea {
   flex-direction: column;
   padding: 0;
   overflow: hidden;
+  /* Reset the wider `.modal` shadow to something tighter — the modal
+     already gets the backdrop's blur to set it apart. */
+  box-shadow: 0 20px 48px -12px rgba(15, 23, 42, 0.28),
+              0 4px 16px -4px rgba(15, 23, 42, 0.16);
 }
 
 .edit-modal-head {
@@ -1373,9 +1419,24 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 16px 20px 12px;
+  padding: 16px 22px 14px;
   border-bottom: 1px solid var(--border);
+  /* Subtle accent wash so the header reads as a distinct surface
+     without resorting to a saturated colour fill. */
   background: linear-gradient(180deg, var(--accent-soft) 0%, var(--surface) 100%);
+  position: relative;
+}
+
+.edit-modal-head::after {
+  /* Hairline divider that matches the body scroll edge, kept as a
+     pseudo-element so the gradient above isn't clipped. */
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--border);
 }
 
 .edit-modal-head h3 {
@@ -1385,10 +1446,11 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  letter-spacing: 0.01em;
 }
 
 .edit-modal-head h3 .key-num {
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--accent);
   background: var(--accent-soft);
@@ -1398,14 +1460,48 @@ textarea {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+/* The header close button is the user's escape hatch when Esc isn't
+   reachable — make it visually obvious on hover instead of the tiny
+   default `.btn-icon` style. */
+.edit-modal-head .btn-icon {
+  width: 30px;
+  height: 30px;
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 1;
+  color: var(--text-muted);
+  border-radius: 8px;
+  transition: background 120ms ease-out, color 120ms ease-out, transform 120ms ease-out;
+}
+
+.edit-modal-head .btn-icon:hover {
+  background: var(--surface-3);
+  color: var(--text);
+  transform: scale(1.04);
+}
+
 .edit-modal-body {
-  padding: 16px 20px;
+  padding: 18px 22px 20px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
   overflow-y: auto;
   flex: 1 1 auto;
   min-height: 0;
+  /* Tame the scrollbar so it doesn't add visual weight in a dialog
+     that's already dense with form fields. Falls back to native
+     styling on browsers that don't support these. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.edit-modal-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.edit-modal-body::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
 }
 
 .edit-modal-body .field {
@@ -1427,9 +1523,12 @@ textarea {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 12px 20px 16px;
+  padding: 14px 22px 16px;
   border-top: 1px solid var(--border);
   background: var(--surface);
+  /* Slight inset highlight so the footer reads as a separate surface
+     even when the modal body has scrolled to the bottom. */
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.04);
 }
 
 /* ============== Add / batch import forms ============== */
@@ -1816,31 +1915,15 @@ textarea {
   padding: 10px 8px;
 }
 
-@media (max-width: 980px) {
-  .app-shell {
-    grid-template-columns: 68px 1fr;
-  }
-
-  .sidebar {
-    padding: 16px 8px 14px;
-  }
-
-  .brand-text,
-  .nav-item span,
-  .nav-section {
-    display: none;
-  }
-
-  .brand {
-    justify-content: center;
-    padding: 6px 0 14px;
-  }
-
-  .nav-item {
-    justify-content: center;
-    padding: 10px 8px;
-  }
-}
+/* No width-based auto-collapse: the previous `@media (max-width:
+   980px)` rule force-collapsed the sidebar by overriding
+   `grid-template-columns` and hiding labels regardless of the
+   user's `.sidebar-collapsed` state, which made the toggle button a
+   no-op once the window dipped below 980 px. The sidebar's collapse
+   state is now purely user-driven via `#sidebarToggle` (persisted in
+   localStorage), and the workspace just shrinks naturally on narrow
+   windows. Users who want more horizontal space at small sizes can
+   click the toggle once and the choice sticks. */
 
 /* ============== IDE auto-config ============== */
 
@@ -2710,13 +2793,18 @@ textarea {
   color: var(--accent);
 }
 
+/* Per-key model mapping section inside the edit modal. Wrapped in
+   its own subtly-tinted card so the user reads it as "advanced
+   per-key overrides" rather than just another row of form fields. */
 .edit-mapping {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px dashed var(--border-strong);
+  margin-top: 6px;
+  padding: 14px 14px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 .edit-mapping-head {
@@ -2727,12 +2815,13 @@ textarea {
 }
 
 .edit-mapping-head > span {
-  font-size: 11.5px;
-  color: var(--text-muted);
+  font-size: 12px;
+  color: var(--text);
   font-weight: 600;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  letter-spacing: 0.01em;
 }
 
 .edit-mapping-hint {
@@ -2740,4 +2829,150 @@ textarea {
   font-size: 11.5px;
   color: var(--text-dim);
   line-height: 1.5;
+  /* Hint text stays a single, calm line — keep height stable across
+     the loading / loaded / error transitions so the dialog doesn't
+     visibly grow when the per-key model fetch settles. */
+  min-height: 1.5em;
+}
+
+/* Vertical stack of mapping rows. Replaces the previous 2-column
+   grid because each row now has a collapsible advanced area below
+   the model input, and that area really wants the full modal width
+   to be useful as a JSON editor. */
+.edit-mapping-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.edit-mapping-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  column-gap: 10px;
+  row-gap: 8px;
+}
+
+/* The model combobox (left column) keeps its full width. */
+.edit-mapping-row > .field {
+  margin: 0;
+}
+
+/* The "高级 / extra_body" disclosure pill — sits next to the model
+   input. We keep it small and tertiary-looking until the user has
+   actually added content (then `.has-content` lights it up so the
+   dot indicator pulls the eye on next visit). */
+.edit-mapping-advanced-toggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  height: 36px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    border-color 120ms ease;
+  white-space: nowrap;
+}
+
+.edit-mapping-advanced-toggle:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-1);
+}
+
+.edit-mapping-advanced-toggle.is-open {
+  color: var(--accent);
+  border-color: var(--accent-soft-2);
+  background: var(--accent-soft);
+}
+
+/* Slot has saved extra_body content — bring it forward so the user
+   can spot existing overrides at a glance. */
+.edit-mapping-advanced-toggle.has-content {
+  color: var(--accent);
+  border-color: var(--accent-soft-2);
+}
+
+.edit-mapping-advanced-toggle .caret {
+  transition: transform 160ms ease;
+}
+
+.edit-mapping-advanced-toggle.is-open .caret {
+  transform: rotate(180deg);
+}
+
+/* The expanded panel: spans both columns of the row grid. Hidden by
+   default — visibility is driven by `.is-open` (toggled in JS in
+   sync with the `hidden` attribute, which is kept around as a
+   belt-and-braces a11y signal). Setting `display: flex`
+   unconditionally would beat the user-agent `[hidden]` rule and
+   leave every slot stuck open on first paint. */
+.edit-mapping-advanced {
+  grid-column: 1 / -1;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.edit-mapping-advanced.is-open {
+  display: flex;
+}
+
+.extra-body-input {
+  width: 100%;
+  min-height: 110px;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  resize: vertical;
+  outline: none;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.extra-body-input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.extra-body-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Live JSON-ness feedback. `.is-valid` is the implicit default look
+   so we keep its style understated; `.is-invalid` flags malformed
+   input clearly without being alarmist (the authoritative check still
+   runs at save time). */
+.extra-body-input.is-invalid {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
+.extra-body-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.extra-body-hint strong {
+  color: var(--text);
+  font-weight: 600;
 }

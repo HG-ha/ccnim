@@ -36,16 +36,26 @@ fn load_config() -> Result<AppConfig, String> {
 #[tauri::command]
 fn save_config(config: AppConfig, state: State<'_, AppState>) -> Result<(), String> {
     config.save().map_err(|e| e.to_string())?;
-    // If the proxy is currently running, hot-swap the key set so label/expiry
-    // edits and add/remove operations take effect without a restart. Live
-    // counters (inflight, recent_requests, failure_count) are preserved for
-    // keys whose secret value is unchanged — see KeyPool::update_keys.
+    // If the proxy is currently running, hot-swap *both* the key pool and
+    // the in-memory config so every part of the request path (per-key
+    // model mappings, the global model_mapping, auth_token,
+    // enable_thinking, …) reflects the new file. Without the
+    // `update_config` half, the proxy kept reading the snapshot frozen
+    // at `start_proxy` time, which silently demoted per-key model
+    // mapping overrides to the global mapping (the symptom users hit
+    // as "my per-key mapping is ignored once the system default is
+    // configured").
+    //
+    // Live counters (inflight, recent_requests, failure_count) are
+    // preserved for keys whose secret value is unchanged — see
+    // KeyPool::update_keys.
     if let Ok(guard) = state.server.lock() {
         if let Some(server) = guard.as_ref() {
             server.key_pool().update_keys(key_pool_entries(
                 &config.nim_api_keys,
                 config.rate_limit_per_key,
             ));
+            server.update_config(config);
         }
     }
     Ok(())

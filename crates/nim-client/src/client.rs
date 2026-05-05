@@ -166,6 +166,16 @@ impl NimClient {
     /// choose a provider based on the request and avoids re-acquiring
     /// the same key twice.
     ///
+    /// `extra_body`, when supplied, is deep-merged into the outgoing
+    /// JSON request body *after* serialisation, with config values
+    /// winning over any matching keys produced by `body`. This is how
+    /// per-mapping-slot overrides (`temperature`, `top_p`,
+    /// `chat_template_kwargs.thinking`, …) actually reach the upstream:
+    /// pre-merging at the typed level would either lose unknown keys
+    /// or risk duplicate top-level fields when `ChatCompletionRequest.extra`
+    /// (which is `serde(flatten)`) collides with one of the typed
+    /// fields. Doing it on the serialized JSON sidesteps both.
+    ///
     /// The lease's provider must be NIM or OpenaiCompat; passing an
     /// Anthropic-compat lease here is a programming error caught by a
     /// debug assertion (and, in release builds, a generic `Request`
@@ -174,17 +184,24 @@ impl NimClient {
         &self,
         lease: KeyLease,
         body: ChatCompletionRequest,
+        extra_body: Option<serde_json::Value>,
     ) -> NimResult<NimChunkStream> {
         debug_assert!(
             !matches!(lease.provider(), ProviderKind::AnthropicCompat),
             "Anthropic-compat upstream must use AnthropicPassthroughClient"
         );
+        let mut json_body = serde_json::to_value(&body).map_err(|err| {
+            NimClientError::Request(format!("failed serializing chat body: {err}"))
+        })?;
+        if let Some(extra) = extra_body.as_ref() {
+            proxy_core::deep_merge_json(&mut json_body, extra);
+        }
         let base = lease.base_url().trim_end_matches('/').to_string();
         let response = self
             .http
             .post(format!("{base}/chat/completions"))
             .bearer_auth(lease.key())
-            .json(&body)
+            .json(&json_body)
             .send()
             .await
             .map_err(|e| {

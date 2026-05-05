@@ -19,11 +19,21 @@ type NimApiKey = {
   /// Whether this key is enabled.
   enabled?: boolean;
   /// Per-key model mapping. If undefined, falls back to global config.
+  /// Each slot also carries an optional `*_extra_body` JSON object —
+  /// arbitrary fields the proxy deep-merges into the outgoing request
+  /// body whenever this slot is the one that wins resolution. Lets
+  /// power users pin upstream-specific knobs (`temperature`, `top_p`,
+  /// `chat_template_kwargs.thinking`, …) per-mapping without dedicated
+  /// GUI fields. Config values *win* over anything Claude Code sent.
   model_mapping?: {
     default_model?: string | null;
+    default_extra_body?: Record<string, unknown> | null;
     opus_model?: string | null;
+    opus_extra_body?: Record<string, unknown> | null;
     sonnet_model?: string | null;
+    sonnet_extra_body?: Record<string, unknown> | null;
     haiku_model?: string | null;
+    haiku_extra_body?: Record<string, unknown> | null;
   };
   /// Per-key rate-limit override (requests per the global window).
   /// `null` / undefined means "use the provider default": NIM picks
@@ -191,6 +201,18 @@ type IdeApplyReport = {
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const toastEl = document.querySelector<HTMLDivElement>("#toast")!;
+/// Dedicated mount point for the edit-key modal — lives in the body
+/// directly (see `index.html`), NOT inside `#app`. Keeping it out of
+/// the main render tree means full `render()` calls (status polls,
+/// sidebar nav, etc.) don't blow away the modal DOM mid-edit, so the
+/// CSS entrance animation only plays once per session and the
+/// currently-focused input keeps its focus / cursor / IME state.
+const editModalRoot = document.querySelector<HTMLDivElement>("#editModalRoot")!;
+/// Tracks whether the modal wrapper (`.modal-backdrop > .modal`) is
+/// currently mounted. Used by `renderEditModalRoot` to decide between
+/// a first-mount (full innerHTML write + animation) and an in-place
+/// update (focus-preserving inner re-render only).
+let editModalMounted = false;
 
 let config: AppConfig | null = null;
 let proxyStatus: ProxyStatus | null = null;
@@ -205,8 +227,23 @@ let idesScanning = false;
 let idesScanError: string | null = null;
 let ideApplying: string | null = null;
 let sidebarCollapsed = (() => {
+  // Persisted user choice always wins. With no saved preference we
+  // fall back on a width heuristic — narrow windows default to
+  // collapsed so the 232 px expanded sidebar doesn't eat most of
+  // the workspace on first launch — but the moment the user clicks
+  // the toggle that choice sticks via localStorage and the heuristic
+  // stops applying (resize during a session does NOT bounce the
+  // sidebar around uninvited).
   try {
-    return window.localStorage.getItem("fcc.sidebarCollapsed") === "1";
+    const stored = window.localStorage.getItem("fcc.sidebarCollapsed");
+    if (stored === "1") return true;
+    if (stored === "0") return false;
+  } catch {
+    // localStorage unavailable (private mode, embedded webview) —
+    // fall through to the width heuristic.
+  }
+  try {
+    return window.innerWidth < 980;
   } catch {
     return false;
   }
@@ -266,7 +303,33 @@ const editForm = {
   expiresAt: "",
   provider: "nim" as ProviderKind,
   baseUrl: "",
-  modelMapping: { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" },
+  /// Each slot keeps both the upstream model ID *and* the slot's
+  /// `extra_body` as a free-form JSON text. We store the raw text
+  /// (rather than a parsed object) so half-written input survives
+  /// modal re-renders without exploding on every keystroke; parsing
+  /// happens at save time inside [`buildPerKeyModelMapping`].
+  modelMapping: {
+    defaultModel: "",
+    defaultExtraBody: "",
+    opusModel: "",
+    opusExtraBody: "",
+    sonnetModel: "",
+    sonnetExtraBody: "",
+    haikuModel: "",
+    haikuExtraBody: "",
+  },
+  /// Which slot's `extra_body` editor is currently expanded. Tracked
+  /// in form state (rather than via a CSS-only `<details>`) so the
+  /// disclosure survives the partial re-renders that
+  /// `renderEditModalRoot` triggers when models load, the provider
+  /// changes, etc. Auto-opens when there's pre-existing content for
+  /// a slot so users don't have to hunt for their own data.
+  advancedExpanded: {
+    default: false,
+    opus: false,
+    sonnet: false,
+    haiku: false,
+  },
   availableModels: [] as string[],
   modelsLoading: false,
   modelsError: null as string | null,
@@ -533,6 +596,15 @@ async function refreshStatus() {
 
 async function save(silent = false): Promise<boolean> {
   if (!config) return false;
+  // Pre-validate so the user gets an immediate, page-aware toast
+  // instead of round-tripping through Tauri only to be told the
+  // backend rejected the payload. Mirrors `AppConfig::validate_for_save`
+  // on the Rust side — keep them in lockstep.
+  const validationError = validateConfigBeforeSave(config);
+  if (validationError) {
+    toast(validationError, "error");
+    return false;
+  }
   try {
     await invoke("save_config", { config });
     if (!silent) toast("配置已保存", "success");
@@ -541,6 +613,18 @@ async function save(silent = false): Promise<boolean> {
     toast(`保存失败: ${error}`, "error");
     return false;
   }
+}
+
+/// Frontend mirror of `AppConfig::validate_for_save`. Returns a
+/// user-facing error message when something is wrong, or `null`
+/// when the config is safe to persist. Centralised so both the
+/// "保存配置" button and the per-key edit / add flows pick up the
+/// same checks without duplicating the rules at every call site.
+function validateConfigBeforeSave(cfg: AppConfig): string | null {
+  if (!cfg.model_mapping.default_model.trim()) {
+    return "默认模型不能为空 — 请在「模型映射」页填写一个默认模型 ID 后再保存";
+  }
+  return null;
 }
 
 async function startProxy() {
@@ -820,13 +904,35 @@ function beginEditKey(id: string) {
   if (key.model_mapping) {
     editForm.modelMapping = {
       defaultModel: key.model_mapping.default_model ?? "",
+      defaultExtraBody: stringifyExtraBody(key.model_mapping.default_extra_body),
       opusModel: key.model_mapping.opus_model ?? "",
+      opusExtraBody: stringifyExtraBody(key.model_mapping.opus_extra_body),
       sonnetModel: key.model_mapping.sonnet_model ?? "",
+      sonnetExtraBody: stringifyExtraBody(key.model_mapping.sonnet_extra_body),
       haikuModel: key.model_mapping.haiku_model ?? "",
+      haikuExtraBody: stringifyExtraBody(key.model_mapping.haiku_extra_body),
     };
   } else {
-    editForm.modelMapping = { defaultModel: "", opusModel: "", sonnetModel: "", haikuModel: "" };
+    editForm.modelMapping = {
+      defaultModel: "",
+      defaultExtraBody: "",
+      opusModel: "",
+      opusExtraBody: "",
+      sonnetModel: "",
+      sonnetExtraBody: "",
+      haikuModel: "",
+      haikuExtraBody: "",
+    };
   }
+  // Auto-expand any slot that already has an `extra_body` so the
+  // user can see (and edit) their existing override on first paint
+  // without an extra click.
+  editForm.advancedExpanded = {
+    default: editForm.modelMapping.defaultExtraBody.length > 0,
+    opus: editForm.modelMapping.opusExtraBody.length > 0,
+    sonnet: editForm.modelMapping.sonnetExtraBody.length > 0,
+    haiku: editForm.modelMapping.haikuExtraBody.length > 0,
+  };
   // Seed the dropdown with the global cache so it's never empty during
   // the round-trip; the per-key fetch below will replace it as soon as
   // the upstream responds.
@@ -835,14 +941,18 @@ function beginEditKey(id: string) {
   editForm.modelsError = null;
   editingKeyId = id;
   addPanel = null;
-  render();
+  // Mount the modal directly in its dedicated root — no need to
+  // rebuild the entire app shell just to show a dialog.
+  renderEditModalRoot();
   void refreshEditAvailableModels(id);
 }
 
 /// Pull the model catalog for a single configured key and stash it on
-/// `editForm.availableModels`. Re-renders only when the editor is still
-/// open for *this* key, so a slow response that lands after the user
-/// already cancelled / switched cards doesn't snap the UI back open.
+/// `editForm.availableModels`. Re-renders only the modal (not the
+/// whole app) when the editor is still open for *this* key, so a slow
+/// response that lands after the user already cancelled / switched
+/// cards doesn't snap the UI back open and a response that lands
+/// while the user is typing doesn't steal focus from the input.
 async function refreshEditAvailableModels(keyId: string) {
   const key = config?.nim_api_keys.find((k) => k.id === keyId);
   if (!key) return;
@@ -851,12 +961,12 @@ async function refreshEditAvailableModels(keyId: string) {
     editForm.modelsLoading = false;
     editForm.modelsError =
       "Anthropic 兼容上游不暴露 /models，请直接手动填写模型 ID";
-    if (editingKeyId === keyId) render();
+    if (editingKeyId === keyId) renderEditModalRoot();
     return;
   }
   editForm.modelsLoading = true;
   editForm.modelsError = null;
-  if (editingKeyId === keyId) render();
+  if (editingKeyId === keyId) renderEditModalRoot();
   try {
     const response = await invoke<{ data: Array<{ id: string }> }>(
       "fetch_models_for_key",
@@ -871,14 +981,14 @@ async function refreshEditAvailableModels(keyId: string) {
   } finally {
     if (editingKeyId === keyId) {
       editForm.modelsLoading = false;
-      render();
+      renderEditModalRoot();
     }
   }
 }
 
 function cancelEdit() {
   editingKeyId = null;
-  render();
+  closeEditModal();
 }
 
 async function submitEditKey(id: string) {
@@ -899,6 +1009,11 @@ async function submitEditKey(id: string) {
     toast("已经存在另一个相同值的 Key", "error");
     return;
   }
+  const mappingResult = buildPerKeyModelMapping(editForm.modelMapping);
+  if (!mappingResult.ok) {
+    toast(mappingResult.error, "error");
+    return;
+  }
   const before = config.nim_api_keys[idx];
   config.nim_api_keys[idx] = {
     ...before,
@@ -907,7 +1022,7 @@ async function submitEditKey(id: string) {
     expires_at: datetimeLocalToUnix(editForm.expiresAt),
     provider: editForm.provider,
     base_url: editForm.baseUrl.trim().replace(/\/$/, ""),
-    model_mapping: buildPerKeyModelMapping(editForm.modelMapping),
+    model_mapping: mappingResult.mapping,
     rate_limit: parseRateLimit(editForm.rateLimit),
   };
   if (!(await save(true))) {
@@ -916,34 +1031,120 @@ async function submitEditKey(id: string) {
   }
   toast("已更新该 Key", "success");
   editingKeyId = null;
+  // Close the modal first (no replay of the entrance animation since
+  // it was mounted-once), then refresh the underlying keys grid so
+  // the card reflects the new label / expiry / provider / mapping.
+  closeEditModal();
   render();
 }
 
-/// Pack the four free-text fields back into a `model_mapping` object,
-/// returning `undefined` when every field is blank. This is what makes
-/// the persisted JSON tidy: a key with no overrides serialises as a
-/// plain credential record without a redundant `"model_mapping": {}`.
+/// Pretty-print an `extra_body` JSON object into the multi-line form
+/// the textarea expects. Returns `""` when the input is null/undefined
+/// or an empty object so the textarea starts empty (and the
+/// auto-expand heuristic in `beginEditKey` can tell "user has data
+/// here" apart from "slot is empty").
+function stringifyExtraBody(value: Record<string, unknown> | null | undefined): string {
+  if (value == null) return "";
+  if (typeof value !== "object" || Array.isArray(value)) return "";
+  if (Object.keys(value).length === 0) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "";
+  }
+}
+
+/// Parse outcome for an `extra_body` textarea: either a JSON object
+/// ready to ship to the backend, the explicit `null` "user left it
+/// blank, no override here", or an `error` carrying a human-readable
+/// reason why the input couldn't be accepted.
+type ExtraBodyParse =
+  | { ok: true; value: Record<string, unknown> | null }
+  | { ok: false; error: string };
+
+/// Parse a single `extra_body` textarea into the wire format. Empty /
+/// whitespace-only input is "no override" (`null`); otherwise we
+/// require a JSON object — non-object values (`42`, `"hello"`,
+/// `[1,2,3]`) are rejected with a clear message because they can't
+/// be sensibly merged into a request body and the runtime would just
+/// ignore them anyway. The slot label (e.g. "默认", "Opus") is
+/// embedded in the error so the user knows which textarea to fix
+/// when several have problems at once.
+function parseExtraBodyField(raw: string, slotLabel: string): ExtraBodyParse {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return { ok: true, value: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `${slotLabel} 的高级参数不是合法 JSON：${(err as Error).message}`,
+    };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      error: `${slotLabel} 的高级参数必须是 JSON 对象（{...}），收到的是 ${Array.isArray(parsed) ? "数组" : typeof parsed}`,
+    };
+  }
+  if (Object.keys(parsed as Record<string, unknown>).length === 0) {
+    return { ok: true, value: null };
+  }
+  return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+/// Pack the per-slot model + extra_body fields back into a
+/// `model_mapping` object, returning `undefined` when every slot is
+/// blank. This is what makes the persisted JSON tidy: a key with no
+/// overrides serialises as a plain credential record without a
+/// redundant `"model_mapping": {}`.
+///
+/// Returns a `{ error }` envelope when any of the textareas contains
+/// invalid JSON so `submitEditKey` can surface a precise toast and
+/// abort the save before mutating the config.
+type BuildMappingResult =
+  | { ok: true; mapping: NimApiKey["model_mapping"] | undefined }
+  | { ok: false; error: string };
+
 function buildPerKeyModelMapping(form: {
   defaultModel: string;
+  defaultExtraBody: string;
   opusModel: string;
+  opusExtraBody: string;
   sonnetModel: string;
+  sonnetExtraBody: string;
   haikuModel: string;
-}): NimApiKey["model_mapping"] | undefined {
+  haikuExtraBody: string;
+}): BuildMappingResult {
   const trim = (s: string) => {
     const t = s.trim();
     return t.length === 0 ? null : t;
   };
-  const defaultModel = trim(form.defaultModel);
-  const opusModel = trim(form.opusModel);
-  const sonnetModel = trim(form.sonnetModel);
-  const haikuModel = trim(form.haikuModel);
-  if (!defaultModel && !opusModel && !sonnetModel && !haikuModel) return undefined;
+  const slots = [
+    { key: "default", label: "默认", model: trim(form.defaultModel), extraRaw: form.defaultExtraBody },
+    { key: "opus", label: "Opus", model: trim(form.opusModel), extraRaw: form.opusExtraBody },
+    { key: "sonnet", label: "Sonnet", model: trim(form.sonnetModel), extraRaw: form.sonnetExtraBody },
+    { key: "haiku", label: "Haiku", model: trim(form.haikuModel), extraRaw: form.haikuExtraBody },
+  ] as const;
+
   const mapping: NonNullable<NimApiKey["model_mapping"]> = {};
-  if (defaultModel) mapping.default_model = defaultModel;
-  if (opusModel) mapping.opus_model = opusModel;
-  if (sonnetModel) mapping.sonnet_model = sonnetModel;
-  if (haikuModel) mapping.haiku_model = haikuModel;
-  return mapping;
+  let anySet = false;
+
+  for (const slot of slots) {
+    const parsed = parseExtraBodyField(slot.extraRaw, slot.label);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    if (slot.model) {
+      mapping[`${slot.key}_model` as const] = slot.model;
+      anySet = true;
+    }
+    if (parsed.value) {
+      mapping[`${slot.key}_extra_body` as const] = parsed.value;
+      anySet = true;
+    }
+  }
+
+  return { ok: true, mapping: anySet ? mapping : undefined };
 }
 
 /// Convert a free-form rate-limit input back into the wire shape:
@@ -990,7 +1191,10 @@ async function deleteKey(id: string) {
     return;
   }
   toast("已删除", "info");
-  if (editingKeyId === id) editingKeyId = null;
+  if (editingKeyId === id) {
+    editingKeyId = null;
+    closeEditModal();
+  }
   render();
 }
 
@@ -1314,10 +1518,14 @@ function render() {
       </main>
     </div>
     ${renderUpdateModal()}
-    ${renderEditModal()}
   `;
 
   bind();
+  // Re-render the edit modal *after* the main app DOM exists, but
+  // separately into its own root so a full render() (sidebar nav,
+  // status poll, etc.) doesn't tear the modal down. Keeps the entrance
+  // animation single-shot per session and preserves input focus.
+  renderEditModalRoot();
   // The sidebar status pill is part of the just-rebuilt DOM; refresh
   // it immediately so the indicator doesn't flash "未启动" for a tick
   // before the next status poll comes back.
@@ -2111,23 +2319,102 @@ function effectiveRateLimitForKey(k: NimApiKey): number | null {
   return null;
 }
 
-/// Modal overlay for editing a single API key. Returns `""` when no
-/// key is being edited; otherwise returns a `.modal-backdrop > .modal`
-/// fragment that the global `render()` appends to the page so the
-/// dialog floats above whichever view is active. The form keeps the
-/// same input IDs so existing field-binding code continues to work.
-function renderEditModal(): string {
-  if (editingKeyId === null || !config) return "";
+/// Render (or update) the edit-key modal in its dedicated
+/// `#editModalRoot` mount point. Splits the work in two:
+///
+///   - **First mount** (when no modal was previously visible): write
+///     the full `.modal-backdrop > .modal` markup so the CSS entrance
+///     animation plays exactly once, and attach the page-level
+///     listeners (Esc, backdrop click).
+///   - **In-place update** (when the modal was already mounted, e.g.
+///     after a provider switch or after the per-key model fetch
+///     settled): rewrite only the modal's inner contents, preserving
+///     keyboard focus and the input's selection range so the user's
+///     typing isn't interrupted. The backdrop and modal wrappers
+///     stay attached, so the entrance animation does NOT replay —
+///     fixing the long-standing "flicker on every edit" bug.
+///
+/// `editingKeyId === null` (or the key was deleted out from under us)
+/// closes the modal cleanly via `closeEditModal`.
+function renderEditModalRoot() {
+  if (editingKeyId === null || !config) {
+    closeEditModal();
+    return;
+  }
   const idx = config.nim_api_keys.findIndex((x) => x.id === editingKeyId);
-  if (idx < 0) return "";
+  if (idx < 0) {
+    closeEditModal();
+    return;
+  }
   const k = config.nim_api_keys[idx];
-  return `
-    <div class="modal-backdrop" id="editBackdrop">
-      <div class="modal modal-wide" role="dialog" aria-labelledby="editModalTitle" aria-modal="true">
-        ${renderEditCardBody(k, idx)}
+  const body = renderEditCardBody(k, idx);
+  if (!editModalMounted) {
+    editModalRoot.innerHTML = `
+      <div class="modal-backdrop" id="editBackdrop">
+        <div class="modal modal-wide" role="dialog" aria-labelledby="editModalTitle" aria-modal="true" id="editModalDialog">
+          ${body}
+        </div>
       </div>
-    </div>
-  `;
+    `;
+    editModalRoot.setAttribute("aria-hidden", "false");
+    editModalMounted = true;
+    attachEditModalGlobalListeners();
+  } else {
+    const dialog = document.getElementById("editModalDialog");
+    if (dialog) {
+      withFocusPreservation(dialog, () => {
+        dialog.innerHTML = body;
+      });
+    }
+  }
+  bindEditModal();
+}
+
+/// Tear down the modal and detach the page-level listeners it owns.
+/// Safe to call when nothing is mounted — both the innerHTML clear
+/// and the listener detach are idempotent.
+function closeEditModal() {
+  if (!editModalMounted) {
+    detachEditModalGlobalListeners();
+    return;
+  }
+  editModalRoot.innerHTML = "";
+  editModalRoot.setAttribute("aria-hidden", "true");
+  editModalMounted = false;
+  detachEditModalGlobalListeners();
+}
+
+/// Re-render the inner contents of `root` while preserving focus and
+/// selection range on whichever element was active. Best-effort:
+/// non-text inputs (`number`, `date`) reject `setSelectionRange`; we
+/// silently fall back to "just refocus" for those.
+function withFocusPreservation(root: HTMLElement, mutate: () => void) {
+  const active = document.activeElement as HTMLElement | null;
+  const focusedId = active && root.contains(active) && active.id ? active.id : null;
+  let savedStart: number | null = null;
+  let savedEnd: number | null = null;
+  if (focusedId && active && "selectionStart" in active) {
+    try {
+      savedStart = (active as HTMLInputElement).selectionStart;
+      savedEnd = (active as HTMLInputElement).selectionEnd;
+    } catch {
+      // Some input types throw on selection access — ignore.
+    }
+  }
+  mutate();
+  if (focusedId) {
+    const next = document.getElementById(focusedId);
+    if (next && typeof (next as HTMLInputElement).focus === "function") {
+      (next as HTMLInputElement).focus();
+      if (savedStart !== null && savedEnd !== null) {
+        try {
+          (next as HTMLInputElement).setSelectionRange(savedStart, savedEnd);
+        } catch {
+          // Same as above — non-text inputs reject selection range.
+        }
+      }
+    }
+  }
 }
 
 /// Form contents inside the edit modal. Kept as a separate function so
@@ -2186,11 +2473,11 @@ function renderEditCardBody(k: NimApiKey, index: number): string {
           <button id="editMappingRefresh" type="button" class="btn-ghost btn-sm" ${editForm.modelsLoading ? "disabled" : ""}>${editForm.modelsLoading ? "刷新中…" : "重新拉取"}</button>
         </div>
         <p class="edit-mapping-hint">${escapeHtml(mappingHint)}</p>
-        <div class="form-grid two">
-          ${editMappingField("editDefaultModel", "默认", editForm.modelMapping.defaultModel, "默认走全局")}
-          ${editMappingField("editOpusModel", "Opus", editForm.modelMapping.opusModel, "走默认")}
-          ${editMappingField("editSonnetModel", "Sonnet", editForm.modelMapping.sonnetModel, "走默认")}
-          ${editMappingField("editHaikuModel", "Haiku", editForm.modelMapping.haikuModel, "走默认")}
+        <div class="edit-mapping-rows">
+          ${editMappingRow("default", "默认", editForm.modelMapping.defaultModel, editForm.modelMapping.defaultExtraBody, "默认走全局")}
+          ${editMappingRow("opus", "Opus", editForm.modelMapping.opusModel, editForm.modelMapping.opusExtraBody, "走默认")}
+          ${editMappingRow("sonnet", "Sonnet", editForm.modelMapping.sonnetModel, editForm.modelMapping.sonnetExtraBody, "走默认")}
+          ${editMappingRow("haiku", "Haiku", editForm.modelMapping.haikuModel, editForm.modelMapping.haikuExtraBody, "走默认")}
         </div>
       </div>
     </div>
@@ -2201,21 +2488,58 @@ function renderEditCardBody(k: NimApiKey, index: number): string {
   `;
 }
 
-/// One row in the "per-key model mapping" grid. Kept private to
-/// `renderEditCard` because the wiring (data-mapping-field, dropdown
-/// element shape) is only meaningful inside that card.
-function editMappingField(id: string, label: string, value: string, fallback: string): string {
+type MappingSlotKey = "default" | "opus" | "sonnet" | "haiku";
+
+/// One row in the per-key mapping editor: the upstream model
+/// combobox plus a collapsible "高级" disclosure that reveals an
+/// `extra_body` JSON textarea. Rendered as a vertical stack rather
+/// than the old 2-column grid because the textarea needs the full
+/// modal width to be useful, and tucking each one under its own row
+/// is the most compact way to keep the model-to-extras mapping
+/// visually 1:1.
+function editMappingRow(
+  slot: MappingSlotKey,
+  label: string,
+  modelValue: string,
+  extraBodyValue: string,
+  fallback: string,
+): string {
+  const inputId = `edit${slot[0].toUpperCase() + slot.slice(1)}Model`;
+  const textareaId = `edit${slot[0].toUpperCase() + slot.slice(1)}ExtraBody`;
+  const expanded = editForm.advancedExpanded[slot];
+  const hasExtras = extraBodyValue.trim().length > 0;
   return `
-    <label class="field">
-      <span>${escapeHtml(label)}</span>
-      <div class="model-combobox">
-        <input id="${id}" class="model-combobox-input" autocomplete="off"
-          placeholder="留空 → ${escapeHtml(fallback)}"
-          value="${escapeHtml(value)}"
-          data-mapping-field="${id}" />
-        <div class="model-combobox-dropdown" hidden></div>
+    <div class="edit-mapping-row">
+      <label class="field">
+        <span>${escapeHtml(label)}</span>
+        <div class="model-combobox">
+          <input id="${inputId}" class="model-combobox-input" autocomplete="off"
+            placeholder="留空 → ${escapeHtml(fallback)}"
+            value="${escapeHtml(modelValue)}"
+            data-mapping-field="${inputId}" />
+          <div class="model-combobox-dropdown" hidden></div>
+        </div>
+      </label>
+      <button type="button"
+        class="edit-mapping-advanced-toggle ${expanded ? "is-open" : ""} ${hasExtras ? "has-content" : ""}"
+        data-advanced-toggle="${slot}"
+        aria-expanded="${expanded ? "true" : "false"}"
+        aria-controls="${textareaId}-wrap"
+        title="${hasExtras ? "已配置 extra_body" : "为该映射配置 extra_body"}">
+        <span class="edit-mapping-advanced-label">高级 / extra_body${hasExtras ? " ●" : ""}</span>
+        <svg class="caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="edit-mapping-advanced ${expanded ? "is-open" : ""}" id="${textareaId}-wrap" ${expanded ? "" : "hidden"}>
+        <textarea id="${textareaId}" class="extra-body-input" spellcheck="false" autocomplete="off"
+          data-extra-body-field="${slot}"
+          placeholder='{
+  "temperature": 0.7,
+  "top_p": 0.95,
+  "chat_template_kwargs": { "thinking": true }
+}'>${escapeHtml(extraBodyValue)}</textarea>
+        <p class="extra-body-hint">JSON 对象。命中该映射的请求会把这里的字段深度合并到上游请求体里，<strong>覆盖</strong>客户端传入的同名字段。留空表示不注入。</p>
       </div>
-    </label>
+    </div>
   `;
 }
 
@@ -2779,11 +3103,14 @@ function bind() {
   bindKeysPage();
   bindIdePage();
   bindUpdateUi();
-  bindEditModal();
 
   bindCopyButtons();
   setupComboboxes();
-  bindEditMappingComboboxes();
+  // The edit modal lives in its own root (`#editModalRoot`) — its
+  // bindings (`bindEditModal`, `bindEditMappingComboboxes`) are
+  // installed by `renderEditModalRoot` after every modal (re)render
+  // and are intentionally NOT re-run here, so a full app re-render
+  // doesn't pile duplicate listeners onto modal elements.
 }
 
 /// Per-edit-card mapping inputs. We can't reuse the global `combobox()`
@@ -2947,14 +3274,14 @@ function bindKeysPage() {
     void submitBatchImport();
   });
 
-  // Provider pill bindings — clicking a pill switches the active
-  // provider for the form it lives in. Wire them up generically by
-  // looking at `data-provider-pick` (which form) and `data-provider`
-  // (the new value). We re-render so the description text and
-  // base_url placeholder track the selection.
+  // Provider pill bindings for the add panels. The modal's pills
+  // (`data-provider-pick="editProvider"`) are wired up by
+  // `bindEditModal` instead, so a click there only re-renders the
+  // modal — the rest of the app shell stays untouched.
   document.querySelectorAll<HTMLButtonElement>("button[data-provider-pick]").forEach((btn) => {
+    const target = btn.dataset.providerPick;
+    if (target === "editProvider") return;
     btn.addEventListener("click", () => {
-      const target = btn.dataset.providerPick;
       const provider = btn.dataset.provider as ProviderKind | undefined;
       if (!target || !provider) return;
       if (target === "addProvider") {
@@ -2969,8 +3296,6 @@ function bindKeysPage() {
         if (!batchAdd.baseUrl.trim()) {
           batchAdd.baseUrl = "";
         }
-      } else if (target === "editProvider") {
-        editForm.provider = provider;
       }
       render();
     });
@@ -3000,11 +3325,16 @@ function bindManagedKeyControls() {
   });
 }
 
-/// Wires up the edit modal: form fields, header close button, footer
-/// Cancel/Save, backdrop click-to-dismiss, and Esc-to-dismiss. Called
-/// from `bind()` after every full render so the modal works regardless
-/// of the active view; relies on the elements only existing while
-/// `editingKeyId !== null`, otherwise the queries no-op.
+/// Wires up everything *inside* the edit modal: form inputs, header
+/// close button, footer Cancel/Save, the per-key provider pills, the
+/// per-key model-mapping comboboxes, and the password visibility
+/// toggle. Called from `renderEditModalRoot` after every (re)render of
+/// the modal contents.
+///
+/// Page-level listeners (Esc, backdrop click) are intentionally
+/// installed by `attachEditModalGlobalListeners` instead — they only
+/// need to be attached once per modal session, regardless of how many
+/// times the inner contents are re-rendered.
 function bindEditModal() {
   const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T | null;
 
@@ -3028,10 +3358,22 @@ function bindEditModal() {
   byId<HTMLInputElement>("editRateLimit")?.addEventListener("input", (e) => {
     editForm.rateLimit = (e.target as HTMLInputElement).value;
   });
+
+  // Password visibility: flip the input type and swap the icon
+  // *in place* — no DOM rewrite, no re-render. Re-rendering the modal
+  // here would steal focus from the input the user is currently
+  // typing in, which is exactly the "shaking" the user reported.
   byId<HTMLButtonElement>("editToggle")?.addEventListener("click", () => {
     showToken = !showToken;
-    render();
+    const valueInput = byId<HTMLInputElement>("editValue");
+    if (valueInput) valueInput.type = showToken ? "text" : "password";
+    const toggleBtn = byId<HTMLButtonElement>("editToggle");
+    if (toggleBtn) {
+      toggleBtn.innerHTML = showToken ? ICONS.eyeOff : ICONS.eye;
+      toggleBtn.title = showToken ? "隐藏" : "显示";
+    }
   });
+
   byId<HTMLButtonElement>("editCancel")?.addEventListener("click", cancelEdit);
   byId<HTMLButtonElement>("editClose")?.addEventListener("click", cancelEdit);
   byId<HTMLButtonElement>("editSave")?.addEventListener("click", (e) => {
@@ -3043,28 +3385,138 @@ function bindEditModal() {
     void refreshEditAvailableModels(editingKeyId);
   });
 
-  // Click outside the dialog (on the backdrop itself) closes the modal.
-  byId<HTMLDivElement>("editBackdrop")?.addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) cancelEdit();
-  });
+  // Per-key provider pills. Switching the provider re-renders only
+  // the modal (focus-preserved) so the URL placeholder, description,
+  // and rate-limit hint follow the new selection without the rest of
+  // the app shell flickering.
+  editModalRoot
+    .querySelectorAll<HTMLButtonElement>('button[data-provider-pick="editProvider"]')
+    .forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const provider = btn.dataset.provider as ProviderKind | undefined;
+        if (!provider || provider === editForm.provider) return;
+        editForm.provider = provider;
+        renderEditModalRoot();
+      });
+    });
 
-  // Esc-to-dismiss. We swap out any prior listener first so repeated
-  // re-renders during the edit session don't pile handlers up; the
-  // listener also no-ops once the modal has been closed via another
-  // path (Cancel / Save / backdrop).
+  // The mapping inputs use a per-key model catalog (not the global
+  // `models` array), so wire their dropdowns up here every time the
+  // modal contents are (re-)rendered.
+  bindEditMappingComboboxes();
+  bindEditMappingAdvanced();
+}
+
+/// Wire up the per-slot "高级 / extra_body" disclosure toggles and
+/// JSON textareas. Toggling a slot updates `editForm.advancedExpanded`
+/// and animates the panel open/closed in place — no full re-render,
+/// so the user's caret/scroll position in any other textarea is
+/// preserved. The textareas write through to `editForm.modelMapping`
+/// on every keystroke; parsing/validation happens later, at save
+/// time, inside `buildPerKeyModelMapping`.
+function bindEditMappingAdvanced() {
+  editModalRoot
+    .querySelectorAll<HTMLButtonElement>("button[data-advanced-toggle]")
+    .forEach((btn) => {
+      const slot = btn.dataset.advancedToggle as MappingSlotKey | undefined;
+      if (!slot) return;
+      btn.addEventListener("click", () => {
+        editForm.advancedExpanded[slot] = !editForm.advancedExpanded[slot];
+        const expanded = editForm.advancedExpanded[slot];
+        // Toggle in place without a re-render so the textarea's
+        // scroll/cursor state survives across collapse/expand.
+        btn.classList.toggle("is-open", expanded);
+        btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+        const wrapId = `${btn.getAttribute("aria-controls") ?? ""}`;
+        const panel = wrapId ? document.getElementById(wrapId) : null;
+        if (panel) {
+          panel.classList.toggle("is-open", expanded);
+          panel.hidden = !expanded;
+          if (expanded) {
+            const ta = panel.querySelector<HTMLTextAreaElement>(".extra-body-input");
+            ta?.focus();
+          }
+        }
+      });
+    });
+
+  editModalRoot
+    .querySelectorAll<HTMLTextAreaElement>("textarea[data-extra-body-field]")
+    .forEach((ta) => {
+      const slot = ta.dataset.extraBodyField as MappingSlotKey | undefined;
+      if (!slot) return;
+      const writeBack = () => {
+        const v = ta.value;
+        switch (slot) {
+          case "default":
+            editForm.modelMapping.defaultExtraBody = v;
+            break;
+          case "opus":
+            editForm.modelMapping.opusExtraBody = v;
+            break;
+          case "sonnet":
+            editForm.modelMapping.sonnetExtraBody = v;
+            break;
+          case "haiku":
+            editForm.modelMapping.haikuExtraBody = v;
+            break;
+        }
+        // Cheap on-the-fly JSON validation: red border when the
+        // textarea has content but parsing fails. Pure visual hint —
+        // the authoritative validation runs at save time.
+        const trimmed = v.trim();
+        if (trimmed.length === 0) {
+          ta.classList.remove("is-invalid", "is-valid");
+          return;
+        }
+        try {
+          const parsed = JSON.parse(trimmed);
+          const isObject =
+            parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+          ta.classList.toggle("is-invalid", !isObject);
+          ta.classList.toggle("is-valid", isObject);
+        } catch {
+          ta.classList.add("is-invalid");
+          ta.classList.remove("is-valid");
+        }
+      };
+      ta.addEventListener("input", writeBack);
+      // Run once on bind so the existing value gets its initial
+      // valid/invalid styling without waiting for a keystroke.
+      writeBack();
+    });
+}
+
+/// Attach the page-level listeners the modal needs (Esc and
+/// click-on-backdrop). Idempotent: detaches any previous Esc handler
+/// before installing a fresh one so repeated re-mounts don't pile
+/// listeners up. The backdrop click listener lives on `editBackdrop`,
+/// which is only mounted once per modal session, so it doesn't need
+/// the same defensive cleanup.
+function attachEditModalGlobalListeners() {
   if (editModalEscHandler) {
     document.removeEventListener("keydown", editModalEscHandler, true);
     editModalEscHandler = null;
   }
-  if (editingKeyId !== null) {
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape" && editingKeyId !== null) {
-        ev.preventDefault();
-        cancelEdit();
-      }
-    };
-    editModalEscHandler = onKey;
-    document.addEventListener("keydown", onKey, true);
+  const onKey = (ev: KeyboardEvent) => {
+    if (ev.key === "Escape" && editingKeyId !== null) {
+      ev.preventDefault();
+      cancelEdit();
+    }
+  };
+  editModalEscHandler = onKey;
+  document.addEventListener("keydown", onKey, true);
+
+  const backdrop = document.getElementById("editBackdrop");
+  backdrop?.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) cancelEdit();
+  });
+}
+
+function detachEditModalGlobalListeners() {
+  if (editModalEscHandler) {
+    document.removeEventListener("keydown", editModalEscHandler, true);
+    editModalEscHandler = null;
   }
 }
 

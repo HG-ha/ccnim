@@ -171,16 +171,39 @@ pub struct ModelMappingConfig {
 /// for this upstream and inherit the rest. Empty strings are treated
 /// as "not set" by the runtime, so the GUI can persist `""` without
 /// regressing into a hard override.
+///
+/// Each slot also carries an optional `*_extra_body` JSON object —
+/// arbitrary fields the user wants deep-merged into the outgoing
+/// request body whenever this slot is the one that wins resolution.
+/// Designed as an escape hatch: any upstream-specific knob without
+/// dedicated GUI fields (`temperature`, `top_p`, `max_tokens`,
+/// `top_k`, `thinking`, `metadata`, …) can be set by typing
+/// free-form JSON into the GUI's "高级 / extra_body" textarea.
+/// Config values *win* over anything the client (Claude Code) sent
+/// for the same keys, so configuring this here makes the override
+/// reliably take effect rather than being optional.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct PerKeyModelMappingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// `extra_body` deep-merged into requests routed through the
+    /// `default_model` slot. Must be a JSON object (anything else is
+    /// silently ignored at runtime to avoid sending malformed bodies
+    /// upstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_extra_body: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opus_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus_extra_body: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sonnet_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonnet_extra_body: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub haiku_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haiku_extra_body: Option<serde_json::Value>,
 }
 
 impl PerKeyModelMappingConfig {
@@ -189,11 +212,27 @@ impl PerKeyModelMappingConfig {
     /// entirely. Lets callers normalise `Some(empty)` into `None` on
     /// save so we don't litter `secrets.json` with no-op objects.
     pub fn is_empty(&self) -> bool {
-        let blank = |s: &Option<String>| s.as_deref().map(str::trim).unwrap_or("").is_empty();
-        blank(&self.default_model)
-            && blank(&self.opus_model)
-            && blank(&self.sonnet_model)
-            && blank(&self.haiku_model)
+        let blank_str = |s: &Option<String>| s.as_deref().map(str::trim).unwrap_or("").is_empty();
+        let blank_json = |v: &Option<serde_json::Value>| match v {
+            None => true,
+            // An empty JSON object means "no overrides" — treat it as
+            // unset so an explicit `{}` round-tripped from the GUI
+            // doesn't pin a no-op object on disk forever.
+            Some(serde_json::Value::Object(map)) => map.is_empty(),
+            // Anything else (string, number, array, …) is technically
+            // valid JSON but useless as an `extra_body` — surface it
+            // as "set" so a hand-edited config.json doesn't get
+            // silently swallowed by the GUI's normalisation.
+            Some(_) => false,
+        };
+        blank_str(&self.default_model)
+            && blank_str(&self.opus_model)
+            && blank_str(&self.sonnet_model)
+            && blank_str(&self.haiku_model)
+            && blank_json(&self.default_extra_body)
+            && blank_json(&self.opus_extra_body)
+            && blank_json(&self.sonnet_extra_body)
+            && blank_json(&self.haiku_extra_body)
     }
 }
 
@@ -219,11 +258,16 @@ impl Default for AppConfig {
 
 impl From<ModelMappingConfig> for ModelMapping {
     fn from(value: ModelMappingConfig) -> Self {
+        // The global mapping has no `extra_body` slots — those live
+        // only on `PerKeyModelMappingConfig` for now. The runtime
+        // `ModelMapping` carries the slot-specific extras as
+        // `Option`s, which default to `None` here.
         Self {
             default_model: value.default_model,
             opus_model: value.opus_model,
             sonnet_model: value.sonnet_model,
             haiku_model: value.haiku_model,
+            ..Default::default()
         }
     }
 }
@@ -263,6 +307,24 @@ impl AppConfig {
         let dirs = ProjectDirs::from("dev", "ccnim", "CCNim")
             .context("could not resolve app config directory")?;
         Ok(dirs.config_dir().to_path_buf())
+    }
+
+    /// Sanity-check invariants every persisted config must satisfy.
+    /// Centralised here so [`Self::save`] and any future external
+    /// validation entry point share one source of truth, and so the
+    /// error messages stay user-facing (Chinese, with a hint about
+    /// which page to fix).
+    ///
+    /// Currently this only enforces that the global `default_model`
+    /// is set, because that's the only field whose emptiness
+    /// silently breaks request handling at runtime. Other invariants
+    /// (port range, host shape, …) are already enforced by the GUI's
+    /// own input types.
+    pub fn validate_for_save(&self) -> Result<()> {
+        if self.model_mapping.default_model.trim().is_empty() {
+            anyhow::bail!("默认模型不能为空 — 请在「模型映射」页填写一个默认模型 ID 后再保存");
+        }
+        Ok(())
     }
 
     /// Load the persistent config and resolve secrets.
@@ -330,6 +392,15 @@ impl AppConfig {
     /// permissions on Unix), everything else goes to `config.json`. The JSON
     /// config file never contains the auth token or NIM keys.
     pub fn save(&self) -> Result<()> {
+        // Validate up front so a malformed config can't slip through to
+        // disk and silently break requests later. The default model is
+        // the runtime's last-resort fallback when no per-key override
+        // matches the incoming Claude model — saving an empty string
+        // here would forward `""` upstream and reliably trip a 400 the
+        // user has to puzzle out from upstream logs. Surface the error
+        // *here* with a message that points at the right page.
+        self.validate_for_save()?;
+
         let config_path = Self::config_path()?;
         let secrets_path = Self::secrets_path()?;
 
@@ -586,5 +657,80 @@ mod tests {
         let mut custom = NimApiKey::from_value("nvapi-x");
         custom.base_url = "https://my.example.com/v1/".to_string();
         assert_eq!(custom.effective_base_url(), "https://my.example.com/v1");
+    }
+
+    /// Empty / whitespace-only global `default_model` must be
+    /// rejected by `validate_for_save` so `save_config` (the GUI's
+    /// IPC entry point) can surface a clear, actionable error
+    /// before the bad value reaches `config.json`. Otherwise a
+    /// round-trip through disk would silently break every request
+    /// that doesn't match a per-key override or a family-specific
+    /// mapping.
+    #[test]
+    fn validate_for_save_rejects_empty_default_model() {
+        let mut cfg = AppConfig::default();
+        assert!(
+            cfg.validate_for_save().is_ok(),
+            "default config should validate"
+        );
+
+        cfg.model_mapping.default_model = String::new();
+        let err = cfg.validate_for_save().unwrap_err().to_string();
+        assert!(
+            err.contains("默认模型"),
+            "error should point to the default-model field, got: {err}"
+        );
+
+        cfg.model_mapping.default_model = "   \t\n  ".to_string();
+        assert!(
+            cfg.validate_for_save().is_err(),
+            "whitespace-only default should also be rejected"
+        );
+
+        cfg.model_mapping.default_model = "deepseek-ai/deepseek-v4-flash".to_string();
+        assert!(cfg.validate_for_save().is_ok());
+    }
+
+    /// `is_empty` must consider both the model strings *and* the
+    /// `extra_body` slots — otherwise a key whose only override is
+    /// an `extra_body` (e.g. "use my own temperature for the default
+    /// upstream") would get its mapping object normalised to `None`
+    /// on save and silently lose the override.
+    #[test]
+    fn per_key_mapping_is_empty_considers_extra_body() {
+        let blank = PerKeyModelMappingConfig::default();
+        assert!(blank.is_empty(), "all-default config should be empty");
+
+        let only_default_model = PerKeyModelMappingConfig {
+            default_model: Some("custom".into()),
+            ..Default::default()
+        };
+        assert!(!only_default_model.is_empty());
+
+        let only_extra_body = PerKeyModelMappingConfig {
+            default_extra_body: Some(serde_json::json!({ "temperature": 0.7 })),
+            ..Default::default()
+        };
+        assert!(
+            !only_extra_body.is_empty(),
+            "an extra_body-only override must NOT be normalised away"
+        );
+
+        // An empty `{}` extra_body is just a no-op and *should* be
+        // treated as unset — we don't want the GUI's "save → reopen"
+        // round-trip to leave a permanent empty object in the file.
+        let empty_object_extra_body = PerKeyModelMappingConfig {
+            default_extra_body: Some(serde_json::json!({})),
+            ..Default::default()
+        };
+        assert!(empty_object_extra_body.is_empty());
+
+        // Whitespace-only model strings still count as empty too.
+        let whitespace_only = PerKeyModelMappingConfig {
+            default_model: Some("   ".into()),
+            opus_model: Some("\t".into()),
+            ..Default::default()
+        };
+        assert!(whitespace_only.is_empty());
     }
 }
