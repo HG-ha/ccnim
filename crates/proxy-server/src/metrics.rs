@@ -172,7 +172,7 @@ impl MetricsRegistry {
                 last_request_at: acc.last_request_at,
             })
             .collect();
-        keys.sort_by(|a, b| b.requests.cmp(&a.requests));
+        keys.sort_by_key(|k| std::cmp::Reverse(k.requests));
 
         let mut models: Vec<ModelMetrics> = inner
             .by_model
@@ -187,7 +187,7 @@ impl MetricsRegistry {
                 last_used_at: acc.last_used_at,
             })
             .collect();
-        models.sort_by(|a, b| b.calls.cmp(&a.calls));
+        models.sort_by_key(|m| std::cmp::Reverse(m.calls));
 
         let total_requests = keys.iter().map(|k| k.requests).sum();
         let total_successes = keys.iter().map(|k| k.successes).sum();
