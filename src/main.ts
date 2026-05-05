@@ -342,7 +342,26 @@ const editForm = {
 /// once a newer release is detected; we keep that handle around so the
 /// "立即安装" button in the dashboard banner can act on it without a
 /// second roundtrip to the GitHub endpoint.
-type UpdateStage = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
+type UpdateStage =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  /// Download is complete and the platform-specific installer has been
+  /// spawned. On Windows specifically, the NSIS installer in
+  /// `passive` mode starts trying to overwrite CCNim.exe within a
+  /// few seconds and will *forcibly kill* the running process if it
+  /// hasn't exited by then — which the user perceives as a sudden
+  /// crash. We use this stage to (1) show a clear "应用即将自动重启"
+  /// notice for ~800 ms, then (2) call `relaunch()` ourselves so the
+  /// graceful shutdown path runs (proxy stops, listener socket
+  /// released, in-flight requests drained) before the installer
+  /// takes over the binary.
+  | "installing"
+  /// Fallback when auto-relaunch fails (rare). Surfaces a manual
+  /// "立即重启" button.
+  | "ready"
+  | "error";
 type UpdateState = {
   stage: UpdateStage;
   currentVersion: string;
@@ -457,25 +476,56 @@ async function startUpdateInstall() {
           updateState.downloaded += event.data.chunkLength;
           break;
         case "Finished":
-          // Move to "ready" so the modal can prompt the user to relaunch.
-          // We deliberately don't call `relaunch()` automatically — the
-          // user might be mid-stream against a Claude Code session and
-          // we want them to click through.
-          updateState.stage = "ready";
+          // Don't go to "ready" here — on Windows the NSIS installer
+          // (spawned in `passive` mode) will start trying to
+          // overwrite CCNim.exe within seconds and forcibly kill our
+          // process if we sit waiting for the user to click "重启".
+          // That kill is what users perceived as a sudden crash.
+          // Switch to the "installing" stage instead so the modal
+          // shows a clear "正在安装，应用将自动重启" notice; the
+          // post-resolve block below then triggers our graceful
+          // exit so we beat the installer to the kill.
+          updateState.stage = "installing";
           break;
       }
       render();
     });
-    // Some upstreams skip the `Finished` event and just resolve the
-    // promise, so make sure we always end up in "ready" if no error
-    // was thrown.
-    updateState.stage = "ready";
+    // Some platforms skip the `Finished` event and just resolve the
+    // promise — make sure we're in "installing" either way.
+    updateState.stage = "installing";
+    render();
+    // Brief, deliberate pause so the "installing/restarting" message
+    // is actually readable before the window vanishes. 800 ms is
+    // short enough that the NSIS installer hasn't usually reached
+    // its "stop running instances" step yet on a typical Windows
+    // box, so our `relaunch()` (which routes through the
+    // `RunEvent::ExitRequested` graceful-shutdown path: stops the
+    // proxy, releases the listener socket, drains in-flight
+    // requests) wins the race against the installer's forced kill.
+    // After we exit, NSIS overwrites the binary and re-launches it
+    // via the NSIS template's built-in /RunAfter step.
+    await new Promise((resolve) => window.setTimeout(resolve, 800));
+    try {
+      await relaunch();
+      // `relaunch()` does not return on success: control transfers
+      // out of the renderer when the process tears down. If we *do*
+      // continue past this line, treat it as a soft failure and
+      // give the user a manual restart affordance below.
+    } catch (relaunchErr) {
+      updateState.stage = "ready";
+      updateState.error = `自动重启失败: ${relaunchErr}`;
+      toast(
+        `自动重启失败，请手动关闭并重新打开 CCNim 完成安装：${relaunchErr}`,
+        "error",
+      );
+      render();
+    }
   } catch (error) {
     updateState.stage = "error";
     updateState.error = String(error);
     toast(`下载/安装失败: ${error}`, "error");
+    render();
   }
-  render();
 }
 
 async function relaunchApp() {
@@ -1612,6 +1662,14 @@ function renderUpdateModal(): string {
       </div>
     `;
     actions = "";
+  } else if (stage === "installing") {
+    title = "正在安装更新…";
+    body = `
+      <p>更新包已下载完成，安装程序已启动。</p>
+      <p>应用将<strong>自动关闭并重新启动</strong>以完成安装，请稍候…</p>
+      <p class="modal-notes">如果新版本未能自动启动，可以手动从开始菜单或桌面快捷方式重新打开 CCNim。</p>
+    `;
+    actions = "";
   } else if (stage === "ready") {
     title = "安装完成";
     body = `<p>新版本已安装，重启应用以生效。重启会先关闭代理服务，端口将正常释放。</p>`;
@@ -1663,12 +1721,14 @@ function bindUpdateUi() {
     void relaunchApp();
   });
   // Click outside the modal to dismiss — only when not in a state where
-  // closing would be destructive (e.g. mid-download). The downloading
-  // path has no actions buttons, so the user visually understands they
-  // need to wait; clicking the backdrop in that state is a no-op.
+  // closing would be destructive. `downloading` and `installing` are
+  // both no-action stages where the user is meant to wait (the
+  // installing stage is an ~800 ms window before we proactively
+  // relaunch); swallowing the backdrop click in those states avoids
+  // an accidental dismiss right as the modal does its job.
   byId<HTMLDivElement>("modalBackdrop")?.addEventListener("click", (e) => {
     if (e.target !== e.currentTarget) return;
-    if (updateState.stage === "downloading") return;
+    if (updateState.stage === "downloading" || updateState.stage === "installing") return;
     dismissUpdateModal();
   });
 }
