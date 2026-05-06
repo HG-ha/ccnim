@@ -551,7 +551,7 @@ async fn openai_compat_messages(
 /// flows through untouched.
 async fn anthropic_passthrough(
     state: ProxyState,
-    _config: Arc<AppConfig>,
+    config: Arc<AppConfig>,
     lease: nim_client::KeyLease,
     request: MessagesRequest,
     extra_body: Option<serde_json::Value>,
@@ -578,6 +578,17 @@ async fn anthropic_passthrough(
             );
         }
     };
+    // The global `enable_thinking` toggle previously only governed the
+    // OpenAI-compat path (it controls `chat_template_kwargs`).
+    // On the Anthropic-passthrough path, callers like Claude Code keep
+    // sending `"thinking": {...}` regardless of our toggle, so a third-
+    // party Anthropic-compatible gateway that doesn't accept extended-
+    // thinking would always 400. Honour the toggle here too: when the
+    // user has explicitly turned thinking off, strip the field before
+    // forwarding so the upstream sees a plain Messages request.
+    if !config.enable_thinking {
+        proxy_core::strip_thinking(&mut body_value);
+    }
     // Apply the per-mapping-slot extra_body to the outgoing JSON,
     // with config values winning. Done here (rather than inside the
     // passthrough client) so the merge contract is identical to the
@@ -586,6 +597,7 @@ async fn anthropic_passthrough(
     if let Some(extra) = extra_body.as_ref() {
         proxy_core::deep_merge_json(&mut body_value, extra);
     }
+    proxy_core::normalize_max_tokens_for_extended_thinking(&mut body_value);
 
     let key_id = lease.stable_id().to_string();
     let model = request.model.clone();

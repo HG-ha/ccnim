@@ -90,7 +90,8 @@ impl NimClient {
                 lease.pool().mark_auth_failed(lease.key_id());
             }
         } else if status != StatusCode::OK {
-            return Err(NimClientError::Request(format!("HTTP {status}")));
+            let body = consume_error_body(response).await;
+            return Err(NimClientError::Request(format!("HTTP {status}: {body}")));
         }
         let models = response
             .json::<NimModelList>()
@@ -152,7 +153,8 @@ impl NimClient {
             .map_err(|e| NimClientError::Request(e.to_string()))?;
         let status = response.status();
         if status != StatusCode::OK {
-            return Err(NimClientError::Request(format!("HTTP {status}")));
+            let body = consume_error_body(response).await;
+            return Err(NimClientError::Request(format!("HTTP {status}: {body}")));
         }
         response
             .json::<NimModelList>()
@@ -210,7 +212,7 @@ impl NimClient {
             })?;
 
         let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
-        handle_status_with_retry(&lease, response.status(), retry_after)?;
+        let response = handle_status_with_retry(&lease, response, retry_after).await?;
         lease.pool().mark_success(lease.key_id());
 
         let byte_stream = response.bytes_stream();
@@ -298,7 +300,7 @@ impl AnthropicPassthroughClient {
             })?;
 
         let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
-        handle_status_with_retry(&lease, response.status(), retry_after)?;
+        let response = handle_status_with_retry(&lease, response, retry_after).await?;
         lease.pool().mark_success(lease.key_id());
 
         let upstream = response.bytes_stream();
@@ -317,13 +319,25 @@ impl AnthropicPassthroughClient {
 /// Raw SSE byte stream returned by [`AnthropicPassthroughClient`].
 pub type AnthropicByteStream = Pin<Box<dyn Stream<Item = NimResult<Bytes>> + Send + 'static>>;
 
-fn handle_status_with_retry(
+/// Inspect the upstream's status line. On `200 OK` the response is
+/// returned to the caller for body streaming; on every other status the
+/// response body is consumed (best-effort, length-capped) and folded
+/// into the error message so that callers — and ultimately the proxy's
+/// HTTP client — can see *why* the upstream rejected the request.
+///
+/// Without this, a 4xx with a perfectly explanatory JSON body
+/// (`{"type":"error","error":{"type":"invalid_request_error",
+/// "message":"thinking is not supported on this model"}}`) would surface
+/// to the client as an opaque `502 Bad Gateway` with no detail, which is
+/// exactly the failure mode that motivated this change.
+async fn handle_status_with_retry(
     lease: &KeyLease,
-    status: StatusCode,
+    response: reqwest::Response,
     retry_after: Option<Duration>,
-) -> NimResult<()> {
+) -> NimResult<reqwest::Response> {
+    let status = response.status();
     match status {
-        StatusCode::OK => Ok(()),
+        StatusCode::OK => Ok(response),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             lease.pool().mark_auth_failed(lease.key_id());
             Err(NimClientError::Authentication)
@@ -339,9 +353,37 @@ fn handle_status_with_retry(
         // outage backs the key off without permanently marking it bad.
         other if other.is_server_error() => {
             lease.pool().mark_network_error(lease.key_id());
-            Err(NimClientError::Request(format!("HTTP {other}")))
+            let body = consume_error_body(response).await;
+            Err(NimClientError::Request(format!("HTTP {other}: {body}")))
         }
-        other => Err(NimClientError::Request(format!("HTTP {other}"))),
+        other => {
+            let body = consume_error_body(response).await;
+            Err(NimClientError::Request(format!("HTTP {other}: {body}")))
+        }
+    }
+}
+
+/// Read up to ~4 KiB of the upstream's error body for diagnostic
+/// purposes. We deliberately do not stream the body — these only run on
+/// non-2xx, the body is almost always a single small JSON object, and
+/// truncation prevents a hostile or misconfigured upstream from filling
+/// our log/error string with megabytes.
+async fn consume_error_body(response: reqwest::Response) -> String {
+    const MAX: usize = 4096;
+    match response.text().await {
+        Ok(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                "<empty body>".to_string()
+            } else if trimmed.len() <= MAX {
+                trimmed.to_string()
+            } else {
+                let mut s: String = trimmed.chars().take(MAX).collect();
+                s.push_str("…<truncated>");
+                s
+            }
+        }
+        Err(e) => format!("<failed reading body: {e}>"),
     }
 }
 

@@ -68,7 +68,16 @@ pub struct Tool {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ThinkingConfig {
-    #[serde(default)]
+    /// Legacy / non-spec field that some experimental clients emit
+    /// (`{"thinking":{"enabled":true}}`). The official Anthropic
+    /// Messages API uses `type: "enabled" | "disabled"` as a
+    /// discriminator and rejects an `enabled` key on the
+    /// `ThinkingEnabled` subtype with the wonderfully cryptic
+    /// "thinking.enabled.enabled: Extra inputs are not permitted".
+    /// Accept it for compatibility with whatever sent it, but never
+    /// emit it on the wire (`skip_serializing_if`) so passthrough
+    /// requests stay valid against real Anthropic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
@@ -148,6 +157,52 @@ pub struct ModelsListResponse {
     pub last_id: Option<String>,
 }
 
+/// Strip the `thinking` field from an outgoing Messages body. Used on
+/// the Anthropic-passthrough path when the user has explicitly turned
+/// extended thinking off in CCNim's config but the client (e.g.
+/// Claude Code, Cursor) keeps emitting `"thinking": {...}`. Some third-
+/// party Anthropic-compatible gateways reject `thinking` outright, so
+/// honouring the toggle here is the only escape hatch the user has.
+pub fn strip_thinking(body: &mut Value) {
+    if let Value::Object(map) = body {
+        map.remove("thinking");
+    }
+}
+
+/// Mutates an outgoing `/v1/messages` JSON body so it satisfies Anthropic's
+/// extended-thinking rule: `max_tokens` must be **strictly greater** than
+/// `thinking.budget_tokens`.
+///
+/// Hand-written tests (and occasionally mis-synced clients) set both to the
+/// same integer; Anthropic rejects those with HTTP 400. We bump `max_tokens`
+/// by the smallest amount that satisfies the constraint.
+pub fn normalize_max_tokens_for_extended_thinking(body: &mut Value) {
+    let Value::Object(map) = body else {
+        return;
+    };
+    let budget = match map.get("thinking") {
+        Some(Value::Object(th)) => th.get("budget_tokens").and_then(|v| v.as_u64()),
+        _ => None,
+    };
+    let Some(budget) = budget else {
+        return;
+    };
+
+    let Some(Value::Number(n)) = map.get("max_tokens") else {
+        return;
+    };
+    let Some(max) = n.as_u64() else {
+        return;
+    };
+
+    if max <= budget {
+        map.insert(
+            "max_tokens".into(),
+            Value::Number((budget.saturating_add(1)).into()),
+        );
+    }
+}
+
 impl ModelsListResponse {
     pub fn claude_compatible() -> Self {
         let ids = [
@@ -174,5 +229,94 @@ impl ModelsListResponse {
             has_more: false,
             data,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a request body that arrives with the official
+    /// `{"thinking":{"type":"enabled","budget_tokens":N}}` shape must
+    /// round-trip through deserialize → serialize *without* gaining a
+    /// spurious `"enabled":null` field, otherwise real Anthropic
+    /// rejects the passthrough with
+    /// `thinking.enabled.enabled: Extra inputs are not permitted`.
+    #[test]
+    fn thinking_config_does_not_leak_enabled_null_on_passthrough() {
+        let raw = r#"{"thinking":{"type":"enabled","budget_tokens":1024}}"#;
+        #[derive(Deserialize, Serialize)]
+        struct Wrap {
+            thinking: ThinkingConfig,
+        }
+        let parsed: Wrap = serde_json::from_str(raw).expect("valid input");
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        // We check for the field-key form `"enabled":` rather than the
+        // substring "enabled", because the legitimate value `"type":"enabled"`
+        // would otherwise produce a false positive.
+        assert!(
+            !reserialized.contains(r#""enabled":"#),
+            "ThinkingConfig must not emit an `enabled` field when not present \
+             in input; got: {reserialized}"
+        );
+        assert!(reserialized.contains(r#""type":"enabled""#));
+        assert!(reserialized.contains(r#""budget_tokens":1024"#));
+    }
+
+    /// If a client *did* explicitly send `enabled`, we still preserve
+    /// it on the way out (some experimental upstreams accept it).
+    #[test]
+    fn thinking_config_preserves_explicit_enabled_field() {
+        let raw = r#"{"enabled":true,"budget_tokens":256}"#;
+        let parsed: ThinkingConfig = serde_json::from_str(raw).unwrap();
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert!(reserialized.contains(r#""enabled":true"#));
+    }
+
+    #[test]
+    fn normalize_max_tokens_bumps_when_equal_to_budget() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "messages": []
+        });
+        normalize_max_tokens_for_extended_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 1025);
+    }
+
+    #[test]
+    fn strip_thinking_removes_field_when_present() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "thinking": { "type": "enabled", "budget_tokens": 512 },
+            "messages": []
+        });
+        strip_thinking(&mut body);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn strip_thinking_is_noop_when_field_absent() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": []
+        });
+        strip_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn normalize_max_tokens_noop_when_already_above_budget() {
+        let mut body = serde_json::json!({
+            "max_tokens": 2048,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+        });
+        normalize_max_tokens_for_extended_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 2048);
     }
 }
